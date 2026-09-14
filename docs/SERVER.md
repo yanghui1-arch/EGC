@@ -50,7 +50,9 @@ python -m egc train --model "$MODEL" --train data/smoke/base/train/sft.jsonl --d
 python -m egc infer --model "$MODEL" --adapter runs/smoke_sft/adapter --jobs data/smoke/base/test/jobs.jsonl --output runs/smoke_adapter.jsonl --max-model-len 2048 --max-new-tokens 256 --batch-size 1
 ```
 
-这是虚构数据的软件与GPU兼容性检查，不评估法律任务。命令默认单卡，BF16；是否能装下取决于实际模型和显存。缺BF16支持时可明确用 `--precision fp16`。Qwen思考模板尽量统一关闭 thinking；若服务器TRL接口不支持相同模板参数，程序会提示后停止，需依据doctor调整。
+这是虚构数据的软件与GPU兼容性检查，不评估法律任务。命令默认单卡，BF16；是否能装下取决于实际模型和显存。缺BF16支持时可明确用 `--precision fp16`。训练在服务器先用tokenizer显式关闭thinking，渲染并生成 `input_ids`、`labels`、`completion_mask`，再交给TRL处理。无需SFTConfig提供 `chat_template_kwargs`，也无需修改原模型的tokenizer文件。训练前校验文本和token级前缀与推理一致，prompt及空thinking前缀不计入loss，回答与结束标记参与loss。超长检查使用同一份实际token序列。
+
+如旧版报 `This thinking template needs TRL chat_template_kwargs support`，更新代码后重新运行 `server_smoke.sh 4b` 即可；脚本自动创建新目录。此前报错发生在模型加载前，不能视为GPU训练失败。此次token化协议变更会拒绝恢复旧协议的训练任务，防止混用不同loss边界。
 
 ## 跑已经准备好的 base
 

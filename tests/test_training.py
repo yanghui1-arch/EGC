@@ -8,11 +8,56 @@ from unittest.mock import Mock, patch
 from egc.cli import parser
 from egc.io import read_json, write_json, write_rows
 from egc.prepare import prepare
-from egc.server import select_training_mode, train
+from egc.server import select_training_mode, tokenize_sft_row, train
 from test_pipeline import row
 
 
+def tokenizer_fixture():
+    """Small deterministic renderer; exercises the flag contract without downloading a model."""
+    tokenizer = Mock(pad_token_id=0, chat_template="template using enable_thinking")
+    def render(messages, tokenize, add_generation_prompt, enable_thinking):
+        if tokenize or enable_thinking:
+            raise AssertionError("Must explicitly render non-thinking text")
+        prefix = "<user>" + messages[0]["content"] + "<assistant><think>\n\n</think>\n\n"
+        return prefix if add_generation_prompt else prefix + messages[-1]["content"] + "<eos>"
+    tokenizer.apply_chat_template.side_effect = render
+    tokenizer.encode.side_effect = lambda text, add_special_tokens: list(map(ord, text))
+    return tokenizer
+
+
 class TrainingTests(unittest.TestCase):
+    def test_explicit_rendering_and_completion_mask(self):
+        tokenizer = tokenizer_fixture()
+        _, rows, _ = prepare([row()], "base")
+        result = tokenize_sft_row(tokenizer, rows[0])
+        prompt = tokenizer.apply_chat_template.call_args_list[0]
+        self.assertFalse(prompt.kwargs["enable_thinking"])
+        self.assertTrue(prompt.kwargs["add_generation_prompt"])
+        self.assertEqual(len(result["labels"]), len(result["input_ids"]))
+        first_label = result["completion_mask"].index(1)
+        self.assertEqual(result["labels"][:first_label], [-100] * first_label)
+        self.assertEqual(result["labels"][first_label:], result["input_ids"][first_label:])
+        supervised = "".join(map(chr, result["labels"][first_label:]))
+        self.assertEqual(supervised, rows[0]["completion"][0]["content"] + "<eos>")
+        self.assertNotIn("<think>", supervised)
+        for call in tokenizer.encode.call_args_list:
+            self.assertFalse(call.kwargs["add_special_tokens"])
+
+    def test_mismatched_template_or_token_boundary_rejected(self):
+        _, rows, _ = prepare([row()], "base")
+        tokenizer = tokenizer_fixture()
+        tokenizer.apply_chat_template.side_effect = ["prefix", "different-prefix-answer"]
+        with self.assertRaisesRegex(ValueError, "inference prefix"):
+            tokenize_sft_row(tokenizer, rows[0])
+        tokenizer = tokenizer_fixture()
+        tokenizer.encode.side_effect = [[1, 2], [1, 3, 4]]
+        with self.assertRaisesRegex(ValueError, "token boundary"):
+            tokenize_sft_row(tokenizer, rows[0])
+        tokenizer = tokenizer_fixture()
+        tokenizer.encode.side_effect = [[1, 2], [1, 2]]
+        with self.assertRaisesRegex(ValueError, "token boundary"):
+            tokenize_sft_row(tokenizer, rows[0])
+
     def test_parameter_boundary_and_explicit_policy(self):
         for count, mode in ((1_700_000_000, "full"), (4_000_000_000, "full"),
                             (6_999_999_999, "full"), (7_000_000_000, "lora"), (8_000_000_000, "lora")):
@@ -38,13 +83,14 @@ class TrainingTests(unittest.TestCase):
                          "--train", str(root / "train.jsonl"), "--dev", str(root / "dev.jsonl"), "--output", str(out)])
                 model = Mock()
                 model.num_parameters.side_effect = lambda only_trainable=False: count if mode == "full" or not only_trainable else 1234
-                tokenizer = Mock(pad_token_id=0, chat_template="plain")
-                tokenizer.apply_chat_template.return_value = [1, 2, 3]
+                tokenizer = tokenizer_fixture()
                 captured = {}
 
                 class Config:
-                    def __init__(self, completion_only_loss=None, chat_template_kwargs=None, **kwargs):
-                        pass
+                    # Reproduces the user's SFTConfig without chat_template_kwargs.
+                    def __init__(self, completion_only_loss=None, **kwargs):
+                        if "chat_template_kwargs" in kwargs:
+                            raise AssertionError("Unsupported SFTConfig argument")
 
                 class Trainer:
                     def __init__(self, processing_class=None, **kwargs):
@@ -75,6 +121,10 @@ class TrainingTests(unittest.TestCase):
                     train(args)
                 self.assertEqual(captured["export"], str(out / folder))
                 self.assertEqual("peft_config" in captured, mode == "lora")
+                for sample in captured["train_dataset"] + captured["eval_dataset"]:
+                    self.assertEqual(set(sample), {"input_ids", "attention_mask", "labels", "completion_mask"})
+                    self.assertIn(-100, sample["labels"])
+                    self.assertTrue(any(label != -100 for label in sample["labels"]))
                 if mode == "full":
                     model.float.assert_called_once_with()
                     model.requires_grad_.assert_called_once_with(True)

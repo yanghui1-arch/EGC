@@ -10,6 +10,7 @@ from pathlib import Path
 from .io import digest, index_unique, read_json, read_rows, write_json, write_rows
 
 MODEL_ROOT = "/mnt/yanghui/models/Qwen"
+SFT_TOKENIZATION_VERSION = "explicit-no-thinking-v1"
 
 
 def select_training_mode(parameter_count, requested="auto"):
@@ -61,6 +62,23 @@ def render_chat(tokenizer, messages):
     return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True, enable_thinking=False)
 
 
+def tokenize_sft_row(tokenizer, row):
+    """Render on the server before TRL; preserve the exact inference prefix and loss mask."""
+    prompt = render_chat(tokenizer, row["prompt"])
+    conversation = tokenizer.apply_chat_template(row["prompt"] + row["completion"],
+                      tokenize=False, add_generation_prompt=False, enable_thinking=False)
+    if not conversation.startswith(prompt):
+        raise ValueError(f"Training template does not preserve the inference prefix: {row['id']}")
+    prompt_ids = tokenizer.encode(prompt, add_special_tokens=False)
+    input_ids = tokenizer.encode(conversation, add_special_tokens=False)
+    if not prompt_ids or input_ids[:len(prompt_ids)] != prompt_ids or len(input_ids) <= len(prompt_ids):
+        raise ValueError(f"Invalid prompt/completion token boundary: {row['id']}")
+    mask = [0] * len(prompt_ids) + [1] * (len(input_ids) - len(prompt_ids))
+    return {"input_ids": input_ids, "attention_mask": [1] * len(input_ids),
+            "completion_mask": mask,
+            "labels": [token if supervised else -100 for token, supervised in zip(input_ids, mask)]}
+
+
 def check_training_rows(train_rows, dev_rows):
     for expected, rows in (("train", train_rows), ("dev", dev_rows)):
         index_unique(rows)
@@ -100,6 +118,7 @@ def train(args):
     if out.exists() and any(out.iterdir()) and not args.resume:
         raise ValueError("Nonempty run directory: use a new output or explicit --resume checkpoint")
     identity = digest({"model": model_path, "model_config": read_json(Path(model_path) / "config.json"),
+                       "tokenization_version": SFT_TOKENIZATION_VERSION,
                        "train": train_rows, "dev": dev_rows,
                        "args": {k: v for k, v in vars(args).items() if k not in {"resume", "output"}}})
     if args.resume:
@@ -114,21 +133,17 @@ def train(args):
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "right"
     # Fail instead of silently dropping the final month label during truncation.
-    too_long = []
+    too_long, tokenized = [], {}
     for row in train_rows + dev_rows:
-        tokens = tokenizer.apply_chat_template(row["prompt"] + row["completion"], tokenize=True, enable_thinking=False)
-        if len(tokens) > args.max_length:
-            too_long.append({"id": row["id"], "tokens": len(tokens)})
+        sample = tokenize_sft_row(tokenizer, row)
+        tokenized[row["id"]] = sample
+        if len(sample["input_ids"]) > args.max_length:
+            too_long.append({"id": row["id"], "tokens": len(sample["input_ids"])})
     if too_long:
         write_json(out / "overlength.json", too_long)
         raise ValueError(f"{len(too_long)} samples exceed max_length; inspect overlength.json, do not truncate targets")
     if "completion_only_loss" not in inspect.signature(SFTConfig).parameters or "processing_class" not in inspect.signature(SFTTrainer).parameters:
         raise ValueError("Installed TRL lacks required APIs; send doctor.json before changing the environment")
-    template_options = {}
-    if "chat_template_kwargs" in inspect.signature(SFTConfig).parameters:
-        template_options["chat_template_kwargs"] = {"enable_thinking": False}
-    elif "enable_thinking" in str(tokenizer.chat_template):
-        raise ValueError("This thinking template needs TRL chat_template_kwargs support for consistent train/infer formatting")
     bf16 = args.precision == "bf16"
     if bf16 and not torch.cuda.is_bf16_supported():
         raise ValueError("GPU lacks bf16 support; choose --precision fp16")
@@ -164,9 +179,11 @@ def train(args):
                        save_steps=args.eval_steps, save_total_limit=2, load_best_model_at_end=True,
                        metric_for_best_model="eval_loss", greater_is_better=False,
                        logging_steps=1, report_to=["tensorboard"], seed=args.seed, data_seed=args.seed,
-                       ddp_find_unused_parameters=False, **template_options)
+                       ddp_find_unused_parameters=False)
     def dataset(rows):
-        return Dataset.from_list([{k: r[k] for k in ("prompt", "completion")} for r in rows])
+        # input_ids tells TRL this is already tokenized: no second chat-template application.
+        # labels supports recent TRL; completion_mask retains older collator compatibility.
+        return Dataset.from_list([tokenized[r["id"]] for r in rows])
     trainer = SFTTrainer(model=model, args=config, processing_class=tokenizer,
                          train_dataset=dataset(train_rows), eval_dataset=dataset(dev_rows), **trainer_options)
     trainable_parameters = trainer.model.num_parameters(only_trainable=True)
@@ -176,6 +193,8 @@ def train(args):
         write_json(out / "run_manifest.json", {"kind": "prompt_pilot_sft", "model": model_path,
                    "training_mode": training_mode, "total_parameters": total_parameters,
                    "trainable_parameters": trainable_parameters,
+                   "tokenization_version": SFT_TOKENIZATION_VERSION,
+                   "tokenized_data_hash": digest(tokenized),
                    "args": {k: v for k, v in vars(args).items() if k != "func"},
                    "train_hash": digest(train_rows), "dev_hash": digest(dev_rows), "training_identity": identity,
                    "environment": environment(args.model, gpu=True)})
@@ -216,6 +235,7 @@ def infer(args):
     settings = {"model": model_path, "model_config": read_json(Path(model_path) / "config.json"),
                 "adapter": str(adapter) if adapter else None, "adapter_config": adapter_config,
                 "jobs_hash": digest(jobs), "seed": args.seed, "temperature": args.temperature,
+                "rendered_prompts_hash": digest(prompts),
                 "max_new_tokens": args.max_new_tokens, "max_model_len": args.max_model_len,
                 "tensor_parallel": args.tensor_parallel, "batch_size": args.batch_size,
                 "weight_inventory": [{"file": str(p.relative_to(directory)), "bytes": p.stat().st_size,
