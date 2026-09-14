@@ -1,0 +1,66 @@
+{
+  "repository": "Statistical-NLP-Lab/LegalChainReasoner",
+  "revision": "c66b3d14d2b6e1c9bb6552b774494c64a08e79b3",
+  "files": [
+    {
+      "path": "LegalChainReasoner.py",
+      "git_blob_sha1": "917ff8e7090e9cd20a0f7e4b833041a4059f9c72",
+      "bytes": 32933
+    },
+    {
+      "path": "README.md",
+      "git_blob_sha1": "15240c0a303dcfb796e471139cb0ce5bbe189cc5",
+      "bytes": 4817
+    },
+    {
+      "path": "data/CAIL/test_data.json",
+      "git_blob_sha1": "a57dd540e503bb00f62f9bedbed088c7480a0e6b",
+      "bytes": 198207
+    },
+    {
+      "path": "data/LAIC/test_data.json",
+      "git_blob_sha1": "ecb74d033b12ee6f66774bdeeab5d47e3e73a343",
+      "bytes": 3061290
+    },
+    {
+      "path": "data/PCCD/test_data.json",
+      "git_blob_sha1": "ee11f3f048f70381adbd633be9c7434386cf89e3",
+      "bytes": 242097
+    },
+    {
+      "path": "legal_chain/fraud/chain.txt",
+      "git_blob_sha1": "d922ff2a3369f800ee027426b6aeb62a4230333e",
+      "bytes": 1426
+    },
+    {
+      "path": "legal_chain/fraud/fraud.txt",
+      "git_blob_sha1": "cb751450f139781934904412433ab40c793dd2fb",
+      "bytes": 235
+    },
+    {
+      "path": "legal_chain/fraud/fraud_nodes.json",
+      "git_blob_sha1": "e56f26d9d6f12ce67a4e4d1b0dde022ef90434ca",
+      "bytes": 2244
+    },
+    {
+      "path": "legal_chain/robbery/chain.txt",
+      "git_blob_sha1": "654d7a7e8672dcdf11a47a701e857ff3c3bad98a",
+      "bytes": 3390
+    },
+    {
+      "path": "legal_chain/robbery/robbery.txt",
+      "git_blob_sha1": "8bbdd5cba519b5bf0d05f12de982ab8184213c25",
+      "bytes": 727
+    },
+    {
+      "path": "legal_chain/robbery/robbery_nodes.json",
+      "git_blob_sha1": "b6e07b8e556bb15840e6c37d9115510d3c9aabc3",
+      "bytes": 4975
+    },
+    {
+      "path": "requirements.txt",
+      "git_blob_sha1": "bbbd11c707c89e96580d39edc648fa8711cfc7a2",
+      "bytes": 1371
+    }
+  ]
+}

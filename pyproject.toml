@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "egc-research"
+version = "0.1.0"
+description = "Evidence-grounded legal chain composition research pilot"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.scripts]
+egc = "egc.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["egc*"]

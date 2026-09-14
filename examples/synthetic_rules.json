@@ -1,0 +1,51 @@
+{
+  "schema_version": 1,
+  "conditions": [
+    {
+      "id": "action",
+      "text": "材料明确写明实施了合成行为A。"
+    },
+    {
+      "id": "returned",
+      "text": "材料明确写明已返还合成物品。"
+    }
+  ],
+  "rules": [
+    {
+      "id": "synthetic_base",
+      "charges": [
+        "合成测试罪名"
+      ],
+      "when": "action",
+      "requires": [],
+      "blocked_by": [],
+      "effect": {
+        "kind": "base",
+        "text": "仅用于软件测试的虚构基础后果，无法律效力。"
+      },
+      "source": "synthetic-fixture",
+      "version": "fixture-v1",
+      "review_status": "approved",
+      "reviewer": "software-test-fixture-only"
+    },
+    {
+      "id": "synthetic_modifier",
+      "charges": [
+        "合成测试罪名"
+      ],
+      "when": "returned",
+      "requires": [
+        "synthetic_base"
+      ],
+      "blocked_by": [],
+      "effect": {
+        "kind": "modifier",
+        "text": "仅用于软件测试的虚构修正后果，不规定实际刑期。"
+      },
+      "source": "synthetic-fixture",
+      "version": "fixture-v1",
+      "review_status": "approved",
+      "reviewer": "software-test-fixture-only"
+    }
+  ]
+}
