@@ -6,7 +6,9 @@
 python -m egc doctor --gpu --output runs/doctor.json
 ```
 
-已收到环境：Python3.12.14、torch2.13.0、transformers5.17.0、TRL1.13.0、datasets5.0.1、accelerate1.15.0，vLLM为0.28.1预发布构建，GPU为两张A100 80GB。PEFT由用户自行安装；本工程不会自动安装或升级环境。版本信息只能证明包存在，训练/推理组合仍需GPU小样例验证。当前仅适配本地因果语言模型的标准接口，MoE或特殊架构需额外验证。
+已收到环境：Python3.12.14、torch2.13.0、transformers5.17.0、TRL1.13.0、datasets5.0.1、accelerate1.15.0，vLLM为0.28.1预发布构建，GPU为两张A100 80GB。PEFT由用户自行安装；本工程不会自动安装或升级环境。用户已回传Qwen3-4B全参及Qwen3-8B LoRA的小样例训练、保存和vLLM加载推理结果，两条链路均完成。这仅验证运行兼容性，不代表benchmark效果。当前仅适配本地因果语言模型的标准接口，MoE或特殊架构需额外验证。
+
+当前本机已准备CAIL候选训练池并完成首轮Flash辅助标注试验，详见[数据与标注进度](DATA_AND_FLASH.md)。候选池尚未完成标注与语义质量检查，暂不启动正式训练；下面的小样例命令保留用于环境回归检查，无需因数据管线更新而重复运行。
 
 ## 已确定的训练规则
 

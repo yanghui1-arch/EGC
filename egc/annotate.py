@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import http.client
 import os
 import time
 import urllib.error
@@ -27,8 +28,39 @@ def request_payload(row, selected, model, max_tokens):
             "response_format": {"type": "json_object"}, "max_tokens": max_tokens, "stream": False}
 
 
-def call_deepseek(payload, key):
+def decode_response(result, include_metadata):
+    choice = result["choices"][0]
+    if choice.get("finish_reason") != "stop":
+        raise ValueError("Incomplete API output; increase --max-tokens or reduce rule set")
+    answer = (json.loads(choice["message"]["content"]), result.get("usage", {}))
+    if include_metadata:
+        return (*answer, {"response_id": result.get("id"), "model": result.get("model"),
+                          "created": result.get("created"), "system_fingerprint": result.get("system_fingerprint")})
+    return answer
+
+
+def call_deepseek(payload, key, include_metadata=False, transport="urllib"):
     """Fixed provider endpoint. Never log headers, keys, or raw error bodies."""
+    if transport == "curl":
+        import subprocess
+        if "\n" in key or "\r" in key:
+            raise ValueError("Invalid credential characters")
+        # Config goes through stdin, never shell interpolation or process arguments.
+        config = '\n'.join(['url = "https://api.deepseek.com/chat/completions"',
+            'request = "POST"', 'header = "Content-Type: application/json"',
+            "header = " + json.dumps("Authorization: Bearer " + key),
+            "data-binary = " + json.dumps(json.dumps(payload, ensure_ascii=True))])
+        completed = subprocess.run(["curl", "--silent", "--show-error", "--max-time", "180", "--config", "-",
+                                    "--write-out", "\n%{http_code}"], input=config,
+                                   capture_output=True, text=True, encoding="utf-8", timeout=190)
+        if completed.returncode:
+            raise RuntimeError("DeepSeek curl transport failed; request outcome unknown, no automatic retry")
+        body, status = completed.stdout.rsplit("\n", 1)
+        if status != "200":
+            raise RuntimeError(f"DeepSeek HTTP {status}; credentials/error body omitted")
+        return decode_response(json.loads(body), include_metadata)
+    if transport != "urllib":
+        raise ValueError("Unknown DeepSeek transport")
     req = urllib.request.Request("https://api.deepseek.com/chat/completions",
                                  data=json.dumps(payload).encode("utf-8"),
                                  headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"})
@@ -36,10 +68,7 @@ def call_deepseek(payload, key):
         try:
             with urllib.request.urlopen(req, timeout=180) as response:
                 result = json.load(response)
-            choice = result["choices"][0]
-            if choice.get("finish_reason") != "stop":
-                raise ValueError("Incomplete API output; increase --max-tokens or reduce rule set")
-            return json.loads(choice["message"]["content"]), result.get("usage", {})
+            return decode_response(result, include_metadata)
         except urllib.error.HTTPError as exc:
             if exc.code in {429, 500, 502, 503, 504} and attempt < 2:
                 time.sleep(2 ** attempt)
@@ -47,6 +76,8 @@ def call_deepseek(payload, key):
             raise RuntimeError(f"DeepSeek HTTP {exc.code}; credentials/error body omitted") from None
         except urllib.error.URLError:
             raise RuntimeError("DeepSeek connection failed; no unsafe automatic retry after ambiguous delivery") from None
+        except (http.client.HTTPException, TimeoutError, ConnectionError):
+            raise RuntimeError("DeepSeek connection closed/timed out; request outcome unknown, no automatic retry") from None
 
 
 def annotate(rows, bundle, output, cache_dir, model, limit=20, max_tokens=4096, dry_run=False, allow_draft=False):

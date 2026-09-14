@@ -10,6 +10,13 @@ from .io import read_json, read_rows, write_json, write_rows
 
 def run(args):
     cmd = args.command
+    if cmd == "build-cail":
+        from .cail import build
+        return build(args.archive, args.member, args.benchmarks, args.output_dir, args.per_charge, args.seed)
+    if cmd == "distill":
+        from .distill import run as distill
+        return distill(read_rows(args.input), read_json(args.profile), args.output_dir,
+                       args.model, args.limit, args.max_tokens, args.ask_key, args.dry_run, args.transport)
     if cmd == "normalize":
         rows = data.canonicalize(read_rows(args.input), args.dataset, args.split)
         write_rows(args.output, rows)
@@ -94,6 +101,23 @@ def parser():
     def io(q):
         q.add_argument("--input", required=True)
         q.add_argument("--output", required=True)
+    q = command("build-cail", "Build original-label training pool with held-out overlap screening")
+    q.add_argument("--archive", required=True)
+    q.add_argument("--member", required=True)
+    q.add_argument("--benchmarks", nargs="+", required=True)
+    q.add_argument("--output-dir", required=True)
+    q.add_argument("--per-charge", type=int, default=1000)
+    q.add_argument("--seed", type=int, default=42)
+    q = command("distill", "Source-only DeepSeek evidence/analysis drafts; preserve original labels")
+    q.add_argument("--input", required=True)
+    q.add_argument("--profile", default="configs/evidence_profile.json")
+    q.add_argument("--output-dir", required=True)
+    q.add_argument("--model", default="deepseek-flash")
+    q.add_argument("--limit", type=int, default=20)
+    q.add_argument("--max-tokens", type=int, default=4096)
+    q.add_argument("--ask-key", action="store_true")
+    q.add_argument("--transport", choices=["urllib", "curl"], default="urllib")
+    q.add_argument("--dry-run", action="store_true")
     q = command("normalize", "Normalize upstream JSON(L), preserve facts, mark train/dev/test")
     io(q)
     q.add_argument("--dataset", required=True)

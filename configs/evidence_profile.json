@@ -1,0 +1,14 @@
+{
+  "version": "fact-circumstances-v2",
+  "status": "research_annotation_schema_not_legal_rules",
+  "conditions": [
+    {"id": "voluntary_appearance", "text": "本案被告人主动到案或主动向办案机关投案，而非仅被抓获。仅记载经传唤到案时，主动性不明确，标unknown；不自动认定法律上的自首。"},
+    {"id": "truthful_confession", "text": "材料明确说明本案被告人如实供述自己的犯罪事实。"},
+    {"id": "returned_or_compensated", "text": "本案被告人本人或明确代其赔偿的人已退还涉案财物或赔偿损失。仅表示愿意、拟赔偿不算已完成。只写单位、借款人、同案人还款或财物被追回，不足以归给本案被告，标unknown。"},
+    {"id": "victim_forgiveness", "text": "被害人明确表示谅解本案被告人；仅赔偿不能推定谅解。"},
+    {"id": "prior_conviction", "text": "材料明确记载本案被告人此前被判有罪；只标前科事实，不自动认定法律上的累犯。"},
+    {"id": "minor_at_offence", "text": "材料足以确认本案被告人在实施本案行为时未满十八周岁；被害人的年龄不算。"},
+    {"id": "secondary_role", "text": "材料明确说明本案被告人在共同犯罪中起次要或辅助作用；只标角色事实，不仅凭多人参与推定。"},
+    {"id": "unsuccessful_completion", "text": "材料明确说明本案被告人的预期犯罪结果未能实现；只标事实，不自动认定法律上的未遂。多个行为、事件或多次作案结果混合时，不将一次未得逞概括全案，标unknown并等待事件级拆解。"}
+  ]
+}

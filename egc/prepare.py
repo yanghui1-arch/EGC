@@ -19,11 +19,13 @@ def prepare(rows, variant, bundle=None, annotations=None, allow_draft=False):
         if row["split"] != "test" and row.get("opinion"):
             sft.append({"id": row["id"], "split": row["split"], "variant": variant,
                         "dataset": row["dataset"], "source_id": row["source_id"],
+                        "opinion_provenance": row.get("opinion_provenance", {"kind": "source_reference_unspecified"}),
                         "prompt": messages, "completion": [{"role": "assistant", "content": target(row)}]})
     manifest = {"schema_version": 1, "variant": variant, "split": rows[0]["split"],
                 "dataset_hash": digest(rows), "rules_hash": digest(bundle) if bundle else None,
                 "annotations_hash": digest(annotations) if annotations else None,
                 "allow_draft_rules": allow_draft, "jobs_hash": digest(jobs), "n_jobs": len(jobs),
                 "n_sft": len(sft), "missing_opinions_excluded_from_sft": len(rows) - len(sft) if rows[0]["split"] != "test" else 0,
+                "synthetic_opinions": sum(r.get("opinion_provenance", {}).get("kind") == "synthetic_source_only" for r in rows),
                 "implementation": "prompt_level_mechanism_pilot_not_ChainAwareEncoding_reproduction"}
     return jobs, sft, manifest

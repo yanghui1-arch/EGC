@@ -2,16 +2,16 @@
 
 面向 LegalChainReasoner 的研究工程：把案情证据映射到法律条件，区分 supported / refuted / unknown，再组合基础规则、修正规则和例外，研究能否改善裁判理由生成与刑期预测。
 
-当前是**提示层面的机制验证版本**，包含本机数据管线、DeepSeek 辅助标注、服务器全参/LoRA SFT、vLLM 推理和评估入口。训练规则：实际总参数量小于7B使用全参，7B及以上使用LoRA。尚未运行真实模型实验，尚未证明 benchmark 提升；尚未实现原论文神经链编码器和后续偏好训练。JurisMA 仅作为结构化事实和检查思路的参考，不作为本方案的核心依赖。
+当前是**提示层面的机制验证版本**，包含本机数据管线、DeepSeek 辅助标注、服务器全参/LoRA SFT、vLLM 推理和评估入口。训练规则：实际总参数量小于7B使用全参，7B及以上使用LoRA。Qwen3-4B全参和Qwen3-8B LoRA已在用户服务器完成虚构小样例的训练、保存、加载和推理；真实法律数据上的训练和benchmark提升尚未验证。尚未实现原论文神经链编码器和后续偏好训练。
 
 ## 现在先做什么
 
-1. 在服务器运行下面的 `doctor`，确认模型的完整目录、GPU 显存及 Python 包版本。
-2. 补齐 LAIC 训练数据；从训练集按案件分组划出独立 dev，检查与三套 test 的重叠。
-3. 从 train/dev 抽取 200 条做人工证据审计；先完成诈骗、抢劫规则及相关修正规则的审核，用小规模实验验证机制。
+1. 已确认服务器两张A100 80GB，并跑通4B全参、8B LoRA小样例，无需重复安装环境。
+2. 改用CAIL官方训练数据，已建立12罪名1200条候选池（1080 train / 120 dev），不再依赖LAIC原生训练集。
+3. 已用DeepSeek-V4.1-Flash完成20条试标；修订主体/事件范围后扩至200条审计，再完成真实法律规则并做小规模机制实验。
 4. 同一模型比较 base、rules、concat、egc，再决定是否投入可训练链编码器。所有规则和超参数在 dev 上确定后再跑 test。
 
-完整实验设计见 [研究计划](docs/RESEARCH_PLAN.md)，已发现的数据与复现问题见 [上游审计](docs/UPSTREAM_AUDIT.md)。
+数据来源、实际试标结果与本机命令见 [CAIL与Flash标注](docs/DATA_AND_FLASH.md)。完整实验设计见 [研究计划](docs/RESEARCH_PLAN.md)，已发现的数据与复现问题见 [上游审计](docs/UPSTREAM_AUDIT.md)。
 
 ## 服务器第一步
 
@@ -22,7 +22,7 @@ git pull --ff-only
 CUDA_VISIBLE_DEVICES=0 bash scripts/server_smoke.sh 4b
 ```
 
-它使用仓库中的虚构样例，无需LAIC训练集；训练后自动加载完整checkpoint推理。换 `8b` 则验证Qwen3-8B LoRA路径。实际GPU兼容性尚待该步骤验证。完整环境采集命令保留如下。
+它使用仓库中的虚构样例；训练后自动加载完整checkpoint推理。换 `8b` 则验证Qwen3-8B LoRA路径。两条路径已在本项目用户服务器跑通，以下命令供新环境复现。
 
 首次拉取：
 
@@ -52,7 +52,7 @@ python -m egc prepare --input data/processed/laic_test.jsonl --variant base --ou
 
 `fetch-upstream` 固定作者仓库 revision 并校验 Git blob 哈希。上游内容只下载到忽略目录；本仓库不重新发布其数据或代码。获取失败可单独传输对应原文件。`prepare` 的输出目录必须为空，避免实验混用。
 
-拿到训练文件后，按其真实字段适配再 normalize；当前适配器支持作者公开格式 `filename / justice / caseCause / opinion / judge`，其中 `judge` 必须是整数月，绝不猜测字符串刑期。
+当前训练路线请使用 [build-cail / distill](docs/DATA_AND_FLASH.md)。以下仅保留将来拿到作者格式训练文件时的备选入口：`filename / justice / caseCause / opinion / judge`，其中 `judge` 必须是整数月，绝不猜测字符串刑期。
 
 ```powershell
 python -m egc normalize --input data/raw/laic_train.json --output data/processed/laic_train_all.jsonl --dataset laic --split train
@@ -67,4 +67,4 @@ python -m egc pilot --input data/splits/dev.jsonl --output data/review/pilot.jso
 
 Git 只管理代码、配置、文档和虚构测试样例。`data/`、`outputs/`、`runs/`、权重、`.env` 均忽略。使用 `python scripts/pack_server.py` 将已经准备好的 base 推理任务打包到本机 `outputs/base_jobs.zip`，手动传到服务器仓库根目录解压；包内只有输入任务、manifest 和校验清单，不包含评估标签。预测文件传回本机再评估。
 
-DeepSeek 只做可选的条件标注，密钥通过环境变量 `DEEPSEEK_API_KEY` 读取，模型 ID 通过 `--model` 明确指定。`.env.example` 仅展示变量名，程序不会自动加载 `.env`。标注流程和规则审核见 [规则与标注](docs/RULES.md)。当前软件测试使用 mock，未发起真实 API 请求。
+DeepSeek用于条件标注和合成分析，密钥通过环境变量 `DEEPSEEK_API_KEY` 或 `distill --ask-key` 隐藏输入读取，模型为 `deepseek-flash`。`.env.example` 仅展示变量名，程序不会自动加载 `.env`。软件测试使用mock；另已完成真实API试标，数据和响应只在本机忽略目录。规则审核见 [规则与标注](docs/RULES.md)。
