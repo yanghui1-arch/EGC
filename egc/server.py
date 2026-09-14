@@ -12,6 +12,18 @@ from .io import digest, index_unique, read_json, read_rows, write_json, write_ro
 MODEL_ROOT = "/mnt/yanghui/models/Qwen"
 
 
+def select_training_mode(parameter_count, requested="auto"):
+    """User policy: total parameters <7B full SFT; >=7B LoRA, including embeddings."""
+    if type(parameter_count) is not int or parameter_count <= 0:
+        raise ValueError("A positive total parameter count is required")
+    if requested not in {"auto", "full", "lora"}:
+        raise ValueError("Unknown training mode")
+    selected = "full" if parameter_count < 7_000_000_000 else "lora"
+    if requested not in {"auto", selected}:
+        raise ValueError(f"Training policy requires {selected} for {parameter_count:,} total parameters")
+    return selected
+
+
 def environment(root=MODEL_ROOT, gpu=False):
     versions = {}
     for package in ("torch", "transformers", "datasets", "trl", "peft", "accelerate", "tensorboard", "vllm"):
@@ -75,7 +87,6 @@ def train(args):
     from datasets import Dataset
     import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer
-    from peft import LoraConfig
     from trl import SFTConfig, SFTTrainer
 
     if not torch.cuda.is_available():
@@ -122,12 +133,27 @@ def train(args):
     if bf16 and not torch.cuda.is_bf16_supported():
         raise ValueError("GPU lacks bf16 support; choose --precision fp16")
     tokenizer_config = read_json(Path(model_path) / "config.json")
-    if tokenizer_config.get("max_position_embeddings", args.max_length) < args.max_length:
+    context_limit = tokenizer_config.get("max_position_embeddings")
+    if context_limit is not None and context_limit < args.max_length:
         raise ValueError("max_length exceeds model context configuration")
+    if tokenizer_config.get("quantization_config"):
+        raise ValueError("This training entrypoint requires unquantized weights; FP8/other quantized training is not configured")
     model = AutoModelForCausalLM.from_pretrained(model_path, local_files_only=True, trust_remote_code=False,
                                                torch_dtype=torch.bfloat16 if bf16 else torch.float16)
-    lora = LoraConfig(r=args.rank, lora_alpha=args.rank*2, lora_dropout=0.05,
-                      target_modules=["q_proj", "k_proj", "v_proj", "o_proj"], task_type="CAUSAL_LM")
+    total_parameters = model.num_parameters()
+    training_mode = select_training_mode(total_parameters, args.training_mode)
+    trainer_options = {}
+    if training_mode == "lora":
+        from peft import LoraConfig
+        trainer_options["peft_config"] = LoraConfig(r=args.rank, lora_alpha=args.rank*2, lora_dropout=0.05,
+                              target_modules=["q_proj", "k_proj", "v_proj", "o_proj"], task_type="CAUSAL_LM")
+    else:
+        # Keep full-SFT master weights/gradients in fp32; Trainer uses bf16/fp16 autocast.
+        # Loading full trainable weights in fp16 also breaks GradScaler unscaling.
+        model.float()
+        model.requires_grad_(True)
+    model.config.use_cache = False
+    print(f"Training mode: {training_mode}; total parameters: {total_parameters:,}")
     config = SFTConfig(output_dir=str(out), num_train_epochs=args.epochs, max_steps=args.max_steps,
                        per_device_train_batch_size=args.batch_size, per_device_eval_batch_size=1,
                        gradient_accumulation_steps=args.grad_accum, learning_rate=args.learning_rate,
@@ -142,17 +168,24 @@ def train(args):
     def dataset(rows):
         return Dataset.from_list([{k: r[k] for k in ("prompt", "completion")} for r in rows])
     trainer = SFTTrainer(model=model, args=config, processing_class=tokenizer,
-                         train_dataset=dataset(train_rows), eval_dataset=dataset(dev_rows), peft_config=lora)
+                         train_dataset=dataset(train_rows), eval_dataset=dataset(dev_rows), **trainer_options)
+    trainable_parameters = trainer.model.num_parameters(only_trainable=True)
+    if training_mode == "full" and trainable_parameters != total_parameters:
+        raise ValueError("Full SFT unexpectedly contains frozen parameters")
     if trainer.is_world_process_zero():
         write_json(out / "run_manifest.json", {"kind": "prompt_pilot_sft", "model": model_path,
+                   "training_mode": training_mode, "total_parameters": total_parameters,
+                   "trainable_parameters": trainable_parameters,
                    "args": {k: v for k, v in vars(args).items() if k != "func"},
                    "train_hash": digest(train_rows), "dev_hash": digest(dev_rows), "training_identity": identity,
                    "environment": environment(args.model, gpu=True)})
     trainer.train(resume_from_checkpoint=args.resume or None)
-    trainer.save_model(str(out / "adapter"))
+    artifact = out / ("adapter" if training_mode == "lora" else "model")
+    trainer.save_model(str(artifact))
     if trainer.is_world_process_zero():
-        tokenizer.save_pretrained(str(out / "adapter"))
+        tokenizer.save_pretrained(str(artifact))
         write_json(out / "completion.json", {"complete": True, "global_step": trainer.state.global_step,
+                    "training_mode": training_mode, "artifact": str(artifact),
                     "best_checkpoint": trainer.state.best_model_checkpoint})
 
 

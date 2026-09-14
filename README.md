@@ -2,7 +2,7 @@
 
 面向 LegalChainReasoner 的研究工程：把案情证据映射到法律条件，区分 supported / refuted / unknown，再组合基础规则、修正规则和例外，研究能否改善裁判理由生成与刑期预测。
 
-当前是**提示层面的机制验证版本**，包含本机数据管线、DeepSeek 辅助标注、服务器 LoRA SFT / vLLM 推理和评估入口。尚未运行真实模型实验，尚未证明 benchmark 提升；尚未实现原论文神经链编码器和后续偏好训练。JurisMA 仅作为结构化事实和检查思路的参考，不作为本方案的核心依赖。
+当前是**提示层面的机制验证版本**，包含本机数据管线、DeepSeek 辅助标注、服务器全参/LoRA SFT、vLLM 推理和评估入口。训练规则：实际总参数量小于7B使用全参，7B及以上使用LoRA。尚未运行真实模型实验，尚未证明 benchmark 提升；尚未实现原论文神经链编码器和后续偏好训练。JurisMA 仅作为结构化事实和检查思路的参考，不作为本方案的核心依赖。
 
 ## 现在先做什么
 
@@ -14,6 +14,15 @@
 完整实验设计见 [研究计划](docs/RESEARCH_PLAN.md)，已发现的数据与复现问题见 [上游审计](docs/UPSTREAM_AUDIT.md)。
 
 ## 服务器第一步
+
+当前用户已回传环境：2×A100 80GB，已有Qwen3-4B和Qwen3-8B；PEFT由用户自行安装。更新代码后，先运行四步Qwen3-4B全参软件小样例：
+
+```bash
+git pull --ff-only
+CUDA_VISIBLE_DEVICES=0 bash scripts/server_smoke.sh 4b
+```
+
+它使用仓库中的虚构样例，无需LAIC训练集；训练后自动加载完整checkpoint推理。换 `8b` 则验证Qwen3-8B LoRA路径。实际GPU兼容性尚待该步骤验证。完整环境采集命令保留如下。
 
 首次拉取：
 

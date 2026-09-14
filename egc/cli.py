@@ -151,8 +151,10 @@ def parser():
     q.add_argument("--model-root", default="/mnt/yanghui/models/Qwen")
     q.add_argument("--gpu", action="store_true")
     q.add_argument("--output", default="runs/doctor.json")
-    q = command("train", "SERVER ONLY: TRL/PEFT completion-only SFT with dev checkpoint selection")
+    q = command("train", "SERVER ONLY: <7B full SFT; >=7B LoRA; dev checkpoint selection")
     q.add_argument("--model", required=True)
+    q.add_argument("--training-mode", choices=["auto", "full", "lora"], default="auto",
+                   help="Auto uses actual total parameter count; explicit mode must obey the <7B full / >=7B LoRA policy")
     q.add_argument("--train", required=True)
     q.add_argument("--dev", required=True)
     q.add_argument("--output", required=True)
