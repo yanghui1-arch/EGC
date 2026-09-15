@@ -2,7 +2,7 @@
 
 **科研主记录：**[创新点、实验计划与进度](docs/RESEARCH_PLAN.md)。每次项目操作前查看，发生变化后更新；具体约定见[AGENTS.md](AGENTS.md)。历史实验报告保留原始结果。
 
-**当前可运行：**[E2本机独立事实抽取](docs/RUN_FACTS_E2.md)，由用户运行6个回归案件的joint/flat/bound对照，最多18次API请求。软件已完成离线检查，真实效果尚未验证。
+**当前可运行：**[E2第二轮本机验证](docs/RUN_FACTS_E2_V2.md)，由用户运行6个回归案件的flat_v2/bound_v2对照，最多12次API请求。77项离线测试通过，新版真实效果尚未验证。[第一轮失败结果](docs/E2_REGRESSION_V1_REPORT.md)已保留，60条新样本暂不扩标。
 
 面向 LegalChainReasoner 的研究工程：把案情证据映射到法律条件，区分 supported / refuted / unknown，再组合基础规则、修正规则和例外，研究能否改善裁判理由生成与刑期预测。
 

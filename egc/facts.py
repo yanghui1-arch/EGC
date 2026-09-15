@@ -8,6 +8,12 @@ from .rules import resolve_quotes, annotation_fingerprint
 
 VERSION = "fact-binding-v1"
 MODES = ("joint", "flat", "bound")
+ALL_MODES = MODES + ("flat_v2", "bound_v2")
+
+
+def version_for(modes):
+    return "fact-events-v2" if any(m.endswith("_v2") for m in modes) else VERSION
+
 REASONS = {"none", "not_mentioned", "unclear_actor", "unclear_event", "conflicting_evidence", "insufficient_evidence"}
 SOURCE_KINDS = {"court_finding", "prosecution", "defense", "witness", "unspecified"}
 COMMON = (
@@ -51,6 +57,9 @@ BOUND = COMMON + (
 
 
 def payload(row, profile, mode, model, max_tokens):
+    if mode in {"flat_v2", "bound_v2"}:
+        from .facts_v2 import payload as revised_payload
+        return revised_payload(row, profile, mode, model, max_tokens)
     if mode == "joint":
         return distill.payload(row, profile, model, max_tokens)
     if mode not in {"flat", "bound"}:
@@ -71,6 +80,9 @@ def span(quote, row, optional=False):
 
 
 def validate(body, row, profile, mode):
+    if mode in {"flat_v2", "bound_v2"}:
+        from .facts_v2 import validate as revised_validate
+        return revised_validate(body, row, profile, mode)
     if mode == "joint":
         checked = distill.validate(body, row, profile)
         return {"annotation": checked["condition_annotation"], "joint_draft": checked,

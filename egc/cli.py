@@ -137,11 +137,11 @@ def parser():
     q.add_argument("--output-dir", required=True)
     q.add_argument("--per-charge", type=int, default=30)
     q.add_argument("--seed", type=int, default=42)
-    q = command("facts-run", "USER RUN: joint/flat/bound extraction, request-bounded cached curl API")
+    q = command("facts-run", "USER RUN: v1/v2 fact extraction, request-bounded cached curl API")
     q.add_argument("--input", required=True)
     q.add_argument("--profile", required=True)
     q.add_argument("--output-dir", required=True)
-    q.add_argument("--modes", nargs="+", choices=["joint", "flat", "bound"], default=["joint", "flat", "bound"])
+    q.add_argument("--modes", nargs="+", choices=["joint", "flat", "bound", "flat_v2", "bound_v2"], default=["joint", "flat", "bound"])
     q.add_argument("--model", default="deepseek-flash")
     q.add_argument("--limit", type=int, default=18, help="Maximum new HTTP requests, not cases; curl never retries")
     q.add_argument("--max-tokens", type=int, default=4096)
@@ -270,7 +270,10 @@ def main():
     p = parser()
     args = p.parse_args()
     try:
-        print(json.dumps(run(args), ensure_ascii=False, indent=2))
+        result = run(args)
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        if args.command == "facts-run" and any(result.get("statuses", {}).get(s, 0) for s in ("api_error", "rejected")):
+            p.exit(3, "EGC: Fact run contains failed requests; inspect manifest/raw diagnostics before continuing.\n")
     except (ValueError, KeyError, FileNotFoundError, RuntimeError) as exc:
         p.exit(2, f"EGC: {exc}\n")
 

@@ -1,0 +1,14 @@
+{
+  "version": "fact-circumstances-v3",
+  "status": "research_annotation_schema_not_legal_rules",
+  "conditions": [
+    {"id": "voluntary_appearance", "text": "本案被告人明确主动到案或主动投案。明确记述其被抓获为反证；证据目录不算。仅归案、传唤后到案为unknown。传唤后虽称投案但未独立明确主动性的混合表述亦为unknown；这是保守的研究操作定义，不认定法律自首。"},
+    {"id": "truthful_confession", "text": "明确如实供述自己的犯罪事实；犯罪叙述、供述笔录目录、仅供述或庭审无异议不足以支持。明确不如实供述才为反证，缺失为unknown。"},
+    {"id": "returned_or_compensated", "text": "被告本人或明确代其履行的人已完成退还财物或赔偿，部分也算。仅追缴、查扣、第三方自行还款或承诺为unknown，不据追缴判断到案方式。明确未退赔才为反证。"},
+    {"id": "victim_forgiveness", "text": "被害人明确谅解本案被告；明确拒绝才为反证，赔偿或未提及不能推断。"},
+    {"id": "prior_conviction", "text": "明确记载本案被告此前被判有罪，明确无前科为反证；未提及为unknown，不认定累犯。"},
+    {"id": "minor_at_offence", "text": "足以确认本案被告实施本案时未满十八周岁；明确当时已成年为反证。被害人年龄或无法回推的当前年龄不足以判断。"},
+    {"id": "secondary_role", "text": "明确本案被告在共同犯罪中起次要或辅助作用；明确主要或组织领导作用为反证。仅受雇、合谋、参与、指认地点均不足以判断。"},
+    {"id": "unsuccessful_completion", "text": "明确本案预期犯罪结果未能实现；明确全案预期结果已实现为反证。单次结果或多次行为结果混合为unknown，不能概括全案，不认定法律未遂。"}
+  ]
+}

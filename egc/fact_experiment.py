@@ -7,7 +7,7 @@ import random
 import time
 
 from . import facts
-from .annotate import call_deepseek, decode_response
+from .annotate import ApiRequestError, call_deepseek, decode_response
 from .cail import BenchmarkGuard, input_risks
 from .data import fact_hash, visible_case
 from .io import digest, index_unique, read_json, read_rows, write_json, write_rows
@@ -92,6 +92,11 @@ def _record(task, cache, row, profile):
     error_path = cache / (task["hash"] + ".error.json")
     pending_path = cache / (task["hash"] + ".pending.json")
     if error_path.exists() or pending_path.exists():
+        if error_path.exists():
+            stored = read_json(error_path)
+            if "diagnostic" in stored:
+                diagnostic = stored["diagnostic"]
+                base["diagnostic"] = ApiRequestError(diagnostic.get("category"), diagnostic.get("code")).diagnostic
         return {**base, "status": "api_error", "reason": "Previous request outcome uncertain; no automatic retry",
                 "billing_outcome_may_be_unknown": True}
     return {**base, "status": "pending"}
@@ -112,7 +117,7 @@ def summarize(rows, records, modes, expectations=None):
             "prompt_tokens": sum(r.get("usage", {}).get("prompt_tokens", 0) for r in group),
             "completion_tokens": sum(r.get("usage", {}).get("completion_tokens", 0) for r in group),
             "measured_seconds": sum(r.get("elapsed_seconds") or 0 for r in group)}
-    comparisons = [(a, b) for a, b in (("joint", "flat"), ("flat", "bound"), ("joint", "bound"))
+    comparisons = [(a, b) for a, b in (("joint", "flat"), ("flat", "bound"), ("joint", "bound"), ("flat_v2", "bound_v2"))
                    if a in modes and b in modes]
     for left, right in comparisons:
         changes, valid_pairs = [], 0
@@ -158,8 +163,9 @@ def run(rows, profile, output_dir, modes=facts.MODES, model="deepseek-flash", li
         raise ValueError("E2 development runs accept train only, never dev/test")
     if any(input_risks(r["facts"]) for r in rows):
         raise ValueError("Screen outcome/appeal inputs before E2")
-    if not modes or len(set(modes)) != len(modes) or not set(modes) <= set(facts.MODES):
-        raise ValueError("Choose unique joint/flat/bound modes")
+    if not modes or len(set(modes)) != len(modes) or not set(modes) <= set(facts.ALL_MODES):
+        raise ValueError("Choose unique supported fact modes")
+    version = facts.version_for(modes)
     if limit <= 0 or max_tokens <= 0 or not model:
         raise ValueError("Invalid request bounds/model")
     tasks = []
@@ -167,7 +173,7 @@ def run(rows, profile, output_dir, modes=facts.MODES, model="deepseek-flash", li
         for mode in modes:
             request = facts.payload(row, profile, mode, model, max_tokens)
             tasks.append({"id": row["id"], "mode": mode, "request": request, "hash": digest([row["id"], request])})
-    identity = digest({"version": facts.VERSION, "source_hash": digest(rows), "profile": profile,
+    identity = digest({"version": version, "source_hash": digest(rows), "profile": profile,
                        "requests": [t["hash"] for t in tasks]})
     out = Path(output_dir)
     manifest_path, cache = out / "manifest.json", out / "raw"
@@ -197,7 +203,7 @@ def run(rows, profile, output_dir, modes=facts.MODES, model="deepseek-flash", li
         report = summarize(rows, records, modes)
         write_rows(out / "records.jsonl", records)
         write_json(out / "report.json", report)
-        manifest = {"identity": identity, "version": facts.VERSION, "source_hash": digest(rows),
+        manifest = {"identity": identity, "version": version, "source_hash": digest(rows),
             "profile": profile, "model": model, "modes": list(modes), "max_tokens": max_tokens,
             "case_ids": [r["id"] for r in rows], "transport": "curl_no_retry",
             "statuses": dict(Counter(r["status"] for r in records)), "new_attempts_this_invocation": calls,
@@ -205,6 +211,10 @@ def run(rows, profile, output_dir, modes=facts.MODES, model="deepseek-flash", li
             "all_structurally_valid": all(r["status"] == "accepted" for r in records),
             "reference_labels_sent": False, "expectations_sent": False,
             "requests": [{k: t[k] for k in ("id", "mode", "hash")} for t in tasks]}
+        if version != facts.VERSION:
+            manifest["pending_requests"] = sum(r["status"] == "pending" for r in records)
+            manifest["failed_requests"] = sum(r["status"] in {"api_error", "rejected"} for r in records)
+            manifest["complete_meaning"] = "All tasks have a terminal status; not all requests succeeded"
         write_json(manifest_path, manifest)
         return manifest
     try:
@@ -233,8 +243,11 @@ def run(rows, profile, output_dir, modes=facts.MODES, model="deepseek-flash", li
                 call_deepseek(task["request"], key, True, "curl", capture_response=capture)
             except (RuntimeError, ValueError, KeyError, TypeError, IndexError, OSError) as exc:
                 if not (cache / (task["hash"] + ".json")).exists():
-                    write_json(cache / (task["hash"] + ".error.json"), {
-                        "error_type": type(exc).__name__, "outcome": "unknown_no_automatic_retry"})
+                    error = {"error_type": type(exc).__name__, "outcome": "unknown_no_automatic_retry"}
+                    if isinstance(exc, ApiRequestError):
+                        error["diagnostic"] = exc.diagnostic
+                        print(str(exc), flush=True)
+                    write_json(cache / (task["hash"] + ".error.json"), error)
                     stop = True
             records[i] = _record(task, cache, indexed[task["id"]], profile)
             snapshot()
@@ -262,5 +275,27 @@ def report_run(rows, run_dir, output, expectations=None):
     report = summarize(rows, records, manifest["modes"], expectations)
     report.update(run_identity=manifest["identity"], source_hash=manifest["source_hash"],
                   version=manifest["version"], profile_hash=digest(manifest["profile"]))
+    if any(mode.endswith("_v2") for mode in manifest["modes"]):
+        # All conditions, including unchanged/unknown states and failures, must be reviewed.
+        queue = []
+        by_key = {(r["id"], r["mode"]): r for r in records}
+        for row in rows:
+            for condition in manifest["profile"]["conditions"]:
+                predictions = {}
+                for mode in manifest["modes"]:
+                    record = by_key[row["id"], mode]
+                    prediction = {"record_status": record["status"], "state": None, "evidence": []}
+                    if record["status"] == "accepted":
+                        c = next(c for c in record["result"]["annotation"]["conditions"] if c["condition_id"] == condition["id"])
+                        prediction.update(state=c["status"], evidence=c["evidence"])
+                    predictions[mode] = prediction
+                queue.append({"id": row["id"], "condition": condition, "facts": row["facts"],
+                              "predictions": predictions, "review_state": None, "review_notes": None,
+                              "review_kind": "unreviewed_not_gold", "run_identity": manifest["identity"]})
+        queue_path = Path(output).with_name("review_queue.jsonl")
+        if queue_path == Path(output):
+            raise ValueError("Report output cannot be named review_queue.jsonl")
+        write_rows(queue_path, queue)
+        report.update(review_queue=str(queue_path), review_items=len(queue), review_complete=False)
     write_json(output, report)
     return report

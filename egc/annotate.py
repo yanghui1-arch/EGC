@@ -39,6 +39,17 @@ def decode_response(result, include_metadata):
     return answer
 
 
+class ApiRequestError(RuntimeError):
+    """Only allowlisted categories and numeric codes may reach disk or the terminal."""
+    def __init__(self, category, code=None):
+        if category not in {"curl_missing", "timeout", "curl_exit", "http_status", "invalid_http_envelope"}:
+            category = "invalid_http_envelope"
+        self.diagnostic = {"category": category}
+        if type(code) is int:
+            self.diagnostic["code"] = code
+        super().__init__("DeepSeek request failed: " + json.dumps(self.diagnostic) + "; no automatic retry")
+
+
 def call_deepseek(payload, key, include_metadata=False, transport="urllib", capture_response=None):
     """Fixed provider endpoint. Never log headers, keys, or raw error bodies."""
     def finish(result):
@@ -60,13 +71,21 @@ def call_deepseek(payload, key, include_metadata=False, transport="urllib", capt
                                         "--write-out", "\n%{http_code}"], input=config,
                                        capture_output=True, text=True, encoding="utf-8", timeout=190)
         except subprocess.TimeoutExpired:
-            raise RuntimeError("DeepSeek curl timeout; request outcome unknown, no automatic retry") from None
+            raise ApiRequestError("timeout") from None
+        except FileNotFoundError:
+            raise ApiRequestError("curl_missing") from None
         if completed.returncode:
-            raise RuntimeError("DeepSeek curl transport failed; request outcome unknown, no automatic retry")
+            raise ApiRequestError("curl_exit", completed.returncode)
+        if "\n" not in completed.stdout:
+            raise ApiRequestError("invalid_http_envelope")
         body, status = completed.stdout.rsplit("\n", 1)
         if status != "200":
-            raise RuntimeError(f"DeepSeek HTTP {status}; credentials/error body omitted")
-        return finish(json.loads(body))
+            raise ApiRequestError("http_status", int(status) if status.isascii() and status.isdigit() else None)
+        try:
+            decoded = json.loads(body)
+        except ValueError:
+            raise ApiRequestError("invalid_http_envelope") from None
+        return finish(decoded)
     if transport != "urllib":
         raise ValueError("Unknown DeepSeek transport")
     req = urllib.request.Request("https://api.deepseek.com/chat/completions",
