@@ -1,0 +1,12 @@
+{
+  "version": "e2-regression-v1",
+  "label_kind": "model_review_expectations_not_human_gold",
+  "items": [
+    {"id": "cail2018_small:train:d98f5138748e7ce8b2e6", "expected": {"voluntary_appearance": "refuted"}, "reason": "Explicit arrest omitted in old output"},
+    {"id": "cail2018_small:train:49533817c0438ef50e5b", "expected": {"voluntary_appearance": "refuted"}, "reason": "Arrest of referenced group includes defendant"},
+    {"id": "cail2018_small:train:56567daaded3f872fe81", "expected": {"secondary_role": "unknown"}, "reason": "Planning does not refute secondary role"},
+    {"id": "cail2018_small:train:1e8211e7756bbc117dde", "expected": {"returned_or_compensated": "supported"}, "reason": "Explicit family repayment"},
+    {"id": "cail2018_small:train:4f68e492dcce8d2e8812", "expected": {"voluntary_appearance": "unknown"}, "reason": "Summoned appearance has unclear voluntariness"},
+    {"id": "cail2018_small:train:f5c7d9e7b722b4a5d7dd", "expected": {"returned_or_compensated": "unknown"}, "reason": "Recovery does not establish defendant repayment"}
+  ]
+}

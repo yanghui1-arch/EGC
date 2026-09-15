@@ -10,6 +10,25 @@ from .io import read_json, read_rows, write_json, write_rows
 
 def run(args):
     cmd = args.command
+    if cmd == "facts-prepare":
+        from .fact_experiment import prepare
+        report = prepare(read_rows(args.pool), [r for p in args.exclude for r in read_rows(p)],
+                         read_json(args.regression), read_json(args.profile), args.output_dir,
+                         args.per_charge, args.seed)
+        return {k: report[k] for k in ("regression_cases", "new_cases", "new_counts", "requested_per_charge")}
+    if cmd == "facts-run":
+        from .fact_experiment import run as run_facts
+        return run_facts(read_rows(args.input), read_json(args.profile), args.output_dir,
+                         args.modes, args.model, args.limit, args.max_tokens, args.ask_key, args.dry_run)
+    if cmd == "facts-report":
+        from .fact_experiment import report_run
+        report = report_run(read_rows(args.input), args.run_dir, args.output,
+                            read_json(args.expectations) if args.expectations else None)
+        return {"output": args.output, "by_mode": report["by_mode"],
+                "regression_agreement_not_accuracy": {
+                    k: {f: v[f] for f in ("matched", "total")}
+                    for k, v in report.get("regression_agreement_not_accuracy", {}).items()},
+                "semantic_accuracy": None, "training_ready": False}
     if cmd == "audit-annotations":
         from .annotation_audit import audit
         report, queue = audit(read_rows(args.source), read_rows(args.annotations), read_json(args.profile),
@@ -110,6 +129,29 @@ def parser():
     def io(q):
         q.add_argument("--input", required=True)
         q.add_argument("--output", required=True)
+    q = command("facts-prepare", "USER RUN: freeze E2 regression and unexposed train cohorts; no API")
+    q.add_argument("--pool", required=True)
+    q.add_argument("--exclude", nargs="+", required=True)
+    q.add_argument("--regression", default="configs/fact_regression.json")
+    q.add_argument("--profile", default="configs/evidence_profile.json")
+    q.add_argument("--output-dir", required=True)
+    q.add_argument("--per-charge", type=int, default=30)
+    q.add_argument("--seed", type=int, default=42)
+    q = command("facts-run", "USER RUN: joint/flat/bound extraction, request-bounded cached curl API")
+    q.add_argument("--input", required=True)
+    q.add_argument("--profile", required=True)
+    q.add_argument("--output-dir", required=True)
+    q.add_argument("--modes", nargs="+", choices=["joint", "flat", "bound"], default=["joint", "flat", "bound"])
+    q.add_argument("--model", default="deepseek-flash")
+    q.add_argument("--limit", type=int, default=18, help="Maximum new HTTP requests, not cases; curl never retries")
+    q.add_argument("--max-tokens", type=int, default=4096)
+    q.add_argument("--ask-key", action="store_true")
+    q.add_argument("--dry-run", action="store_true")
+    q = command("facts-report", "USER RUN: compare raw-validated results; expectations never sent to API")
+    q.add_argument("--input", required=True)
+    q.add_argument("--run-dir", required=True)
+    q.add_argument("--expectations")
+    q.add_argument("--output", required=True)
     q = command("audit-annotations", "Check original labels/evidence; sample semantic review queue")
     q.add_argument("--source", required=True)
     q.add_argument("--annotations", required=True)

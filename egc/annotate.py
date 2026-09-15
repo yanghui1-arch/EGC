@@ -39,8 +39,13 @@ def decode_response(result, include_metadata):
     return answer
 
 
-def call_deepseek(payload, key, include_metadata=False, transport="urllib"):
+def call_deepseek(payload, key, include_metadata=False, transport="urllib", capture_response=None):
     """Fixed provider endpoint. Never log headers, keys, or raw error bodies."""
+    def finish(result):
+        # Preserve successful HTTP envelopes even when content JSON or finish_reason is invalid.
+        if capture_response is not None:
+            capture_response(result)
+        return decode_response(result, include_metadata)
     if transport == "curl":
         import subprocess
         if "\n" in key or "\r" in key:
@@ -50,15 +55,18 @@ def call_deepseek(payload, key, include_metadata=False, transport="urllib"):
             'request = "POST"', 'header = "Content-Type: application/json"',
             "header = " + json.dumps("Authorization: Bearer " + key),
             "data-binary = " + json.dumps(json.dumps(payload, ensure_ascii=True))])
-        completed = subprocess.run(["curl", "--silent", "--show-error", "--max-time", "180", "--config", "-",
-                                    "--write-out", "\n%{http_code}"], input=config,
-                                   capture_output=True, text=True, encoding="utf-8", timeout=190)
+        try:
+            completed = subprocess.run(["curl", "--silent", "--show-error", "--max-time", "180", "--config", "-",
+                                        "--write-out", "\n%{http_code}"], input=config,
+                                       capture_output=True, text=True, encoding="utf-8", timeout=190)
+        except subprocess.TimeoutExpired:
+            raise RuntimeError("DeepSeek curl timeout; request outcome unknown, no automatic retry") from None
         if completed.returncode:
             raise RuntimeError("DeepSeek curl transport failed; request outcome unknown, no automatic retry")
         body, status = completed.stdout.rsplit("\n", 1)
         if status != "200":
             raise RuntimeError(f"DeepSeek HTTP {status}; credentials/error body omitted")
-        return decode_response(json.loads(body), include_metadata)
+        return finish(json.loads(body))
     if transport != "urllib":
         raise ValueError("Unknown DeepSeek transport")
     req = urllib.request.Request("https://api.deepseek.com/chat/completions",
@@ -68,7 +76,7 @@ def call_deepseek(payload, key, include_metadata=False, transport="urllib"):
         try:
             with urllib.request.urlopen(req, timeout=180) as response:
                 result = json.load(response)
-            return decode_response(result, include_metadata)
+            return finish(result)
         except urllib.error.HTTPError as exc:
             if exc.code in {429, 500, 502, 503, 504} and attempt < 2:
                 time.sleep(2 ** attempt)
