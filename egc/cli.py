@@ -10,6 +10,15 @@ from .io import read_json, read_rows, write_json, write_rows
 
 def run(args):
     cmd = args.command
+    if cmd == "audit-annotations":
+        from .annotation_audit import audit
+        report, queue = audit(read_rows(args.source), read_rows(args.annotations), read_json(args.profile),
+                              args.sample_size, args.seed)
+        out = Path(args.output_dir)
+        write_json(out / "report.json", report)
+        write_rows(out / "review_queue.jsonl", queue)
+        return {k: report[k] for k in ("source_cases", "structurally_accepted_cases", "flagged_cases",
+                "review_queue_cases", "semantic_accuracy", "training_ready")}
     if cmd == "build-cail":
         from .cail import build
         return build(args.archive, args.member, args.benchmarks, args.output_dir, args.per_charge, args.seed)
@@ -101,6 +110,13 @@ def parser():
     def io(q):
         q.add_argument("--input", required=True)
         q.add_argument("--output", required=True)
+    q = command("audit-annotations", "Check original labels/evidence; sample semantic review queue")
+    q.add_argument("--source", required=True)
+    q.add_argument("--annotations", required=True)
+    q.add_argument("--profile", default="configs/evidence_profile.json")
+    q.add_argument("--output-dir", required=True)
+    q.add_argument("--sample-size", type=int, default=30)
+    q.add_argument("--seed", type=int, default=42)
     q = command("build-cail", "Build original-label training pool with held-out overlap screening")
     q.add_argument("--archive", required=True)
     q.add_argument("--member", required=True)

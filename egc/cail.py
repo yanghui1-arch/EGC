@@ -10,10 +10,21 @@ from pathlib import Path
 from .data import canonicalize, fact_hash, normalized_fact, split_train, visible_case
 from .io import digest, read_rows, write_json, write_rows
 
+INPUT_SCREEN_VERSION = "input-outcome-and-appeal-v2"
+
 
 def charge_key(value):
     value = value.strip().strip("[]【】")
     return re.sub(r"[\[\]【】，,、\s]", "", value.removesuffix("罪"))
+
+
+def input_risks(facts):
+    risks = []
+    if re.search(r"判处.{0,20}(有期徒刑|拘役|无期徒刑|死刑)|判决如下|建议判处|量刑建议|建议[^。；\n]{0,60}(量刑|刑期)", facts):
+        risks.append("possible_outcome_text_review")
+    if re.search(r"经二审|上诉人|原审|一审.{0,8}(认定|判决|判处)", facts):
+        risks.append("postjudgment_input_review")
+    return risks
 
 
 def adapt(raw, source_id, charge_map):
@@ -37,8 +48,9 @@ def adapt(raw, source_id, charge_map):
     if not isinstance(facts, str) or not facts.strip():
         return None, "missing_facts"
     # Conservative initial pool: also excludes some legitimate prior-conviction descriptions.
-    if re.search(r"判处.{0,20}(有期徒刑|拘役|无期徒刑|死刑)|判决如下|建议判处|量刑建议", facts):
-        return None, "possible_outcome_text_review"
+    risks = input_risks(facts)
+    if risks:
+        return None, risks[0]
     row = canonicalize([{"source_id": source_id, "facts": facts, "charge": charge,
                           "sentence_months": months}], "cail2018_small", "train")[0]
     row["label_provenance"] = {"sentence_months": "original_dataset_meta.term_of_imprisonment.imprisonment",
@@ -147,7 +159,7 @@ def build(archive, member, benchmarks, output_dir, per_charge=1000, seed=42):
     write_rows(out / "dev.jsonl", dev)
     manifest = {"source_url": "https://cail.oss-cn-qingdao.aliyuncs.com/CAIL2018_ALL_DATA.zip",
                 "archive_bytes": Path(archive).stat().st_size, "member": member_info, "seed": seed,
-                "per_charge_cap": per_charge, "counts": dict(counts),
+                "per_charge_cap": per_charge, "counts": dict(counts), "input_screen_version": INPUT_SCREEN_VERSION,
                 "train": len(train), "dev": len(dev), "pool_hash": digest(pool),
                 "train_hash": digest(train), "dev_hash": digest(dev),
                 "charges": {c: len(v) for c, v in sorted(buckets.items())},
