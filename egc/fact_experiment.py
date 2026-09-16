@@ -117,7 +117,7 @@ def summarize(rows, records, modes, expectations=None):
             "prompt_tokens": sum(r.get("usage", {}).get("prompt_tokens", 0) for r in group),
             "completion_tokens": sum(r.get("usage", {}).get("completion_tokens", 0) for r in group),
             "measured_seconds": sum(r.get("elapsed_seconds") or 0 for r in group)}
-    comparisons = [(a, b) for a, b in (("joint", "flat"), ("flat", "bound"), ("joint", "bound"), ("flat_v2", "bound_v2"))
+    comparisons = [(a, b) for a, b in (("joint", "flat"), ("flat", "bound"), ("joint", "bound"), ("flat_v2", "bound_v2"), ("flat_e3", "bound_e3"))
                    if a in modes and b in modes]
     for left, right in comparisons:
         changes, valid_pairs = [], 0
@@ -156,7 +156,7 @@ def summarize(rows, records, modes, expectations=None):
 
 
 def run(rows, profile, output_dir, modes=facts.MODES, model="deepseek-flash", limit=18,
-        max_tokens=4096, ask_key=False, dry_run=False):
+        max_tokens=4096, ask_key=False, dry_run=False, protocol=None):
     index_unique(rows)
     index_unique(profile["conditions"])
     if not rows or any(r["split"] != "train" for r in rows):
@@ -166,6 +166,12 @@ def run(rows, profile, output_dir, modes=facts.MODES, model="deepseek-flash", li
     if not modes or len(set(modes)) != len(modes) or not set(modes) <= set(facts.ALL_MODES):
         raise ValueError("Choose unique supported fact modes")
     version = facts.version_for(modes)
+    is_e3 = any(m.endswith("_e3") for m in modes)
+    if is_e3:
+        from .facts_e3 import check_protocol
+        check_protocol(rows, profile, modes, model, max_tokens, protocol)
+    elif protocol is not None:
+        raise ValueError("--protocol is only supported for E3")
     if limit <= 0 or max_tokens <= 0 or not model:
         raise ValueError("Invalid request bounds/model")
     tasks = []
@@ -173,8 +179,11 @@ def run(rows, profile, output_dir, modes=facts.MODES, model="deepseek-flash", li
         for mode in modes:
             request = facts.payload(row, profile, mode, model, max_tokens)
             tasks.append({"id": row["id"], "mode": mode, "request": request, "hash": digest([row["id"], request])})
-    identity = digest({"version": version, "source_hash": digest(rows), "profile": profile,
-                       "requests": [t["hash"] for t in tasks]})
+    identity_fields = {"version": version, "source_hash": digest(rows), "profile": profile,
+                       "requests": [t["hash"] for t in tasks]}
+    if is_e3:
+        identity_fields["protocol_hash"] = digest(protocol)
+    identity = digest(identity_fields)
     out = Path(output_dir)
     manifest_path, cache = out / "manifest.json", out / "raw"
     if manifest_path.exists():
@@ -189,7 +198,8 @@ def run(rows, profile, output_dir, modes=facts.MODES, model="deepseek-flash", li
         return {"dry_run": True, "cases": len(rows), "modes": list(modes), "total_requests": len(tasks),
                 "remaining_requests": remaining, "new_requests_this_run_at_most": min(limit, remaining),
                 "max_completion_tokens_this_run": min(limit, remaining) * max_tokens,
-                "api_calls": 0, "writes": 0}
+                "api_calls": 0, "writes": 0,
+                **({"protocol_hash": digest(protocol), "conditions": len(profile["conditions"]), "protocol_verified": True} if is_e3 else {})}
     out.mkdir(parents=True, exist_ok=True)
     # Fail closed on concurrent runs. A killed process may leave this lock for explicit inspection.
     lock_path = out / ".run.lock"
@@ -215,6 +225,8 @@ def run(rows, profile, output_dir, modes=facts.MODES, model="deepseek-flash", li
             manifest["pending_requests"] = sum(r["status"] == "pending" for r in records)
             manifest["failed_requests"] = sum(r["status"] in {"api_error", "rejected"} for r in records)
             manifest["complete_meaning"] = "All tasks have a terminal status; not all requests succeeded"
+        if is_e3:
+            manifest.update(protocol=protocol, protocol_hash=digest(protocol))
         write_json(manifest_path, manifest)
         return manifest
     try:
@@ -275,7 +287,16 @@ def report_run(rows, run_dir, output, expectations=None):
     report = summarize(rows, records, manifest["modes"], expectations)
     report.update(run_identity=manifest["identity"], source_hash=manifest["source_hash"],
                   version=manifest["version"], profile_hash=digest(manifest["profile"]))
-    if any(mode.endswith("_v2") for mode in manifest["modes"]):
+    is_e3 = any(mode.endswith("_e3") for mode in manifest["modes"])
+    if is_e3:
+        from .facts_e3 import check_protocol, add_report_details
+        check_protocol(rows, manifest["profile"], manifest["modes"], manifest["model"],
+                       manifest["max_tokens"], manifest["protocol"])
+        if digest(manifest["protocol"]) != manifest["protocol_hash"]:
+            raise ValueError("Frozen protocol hash mismatch")
+        report["protocol_hash"] = manifest["protocol_hash"]
+        add_report_details(report, rows, records, manifest["modes"], manifest["profile"])
+    if any(mode.endswith("_v2") for mode in manifest["modes"]) or is_e3:
         # All conditions, including unchanged/unknown states and failures, must be reviewed.
         queue = []
         by_key = {(r["id"], r["mode"]): r for r in records}
@@ -288,6 +309,10 @@ def report_run(rows, run_dir, output, expectations=None):
                     if record["status"] == "accepted":
                         c = next(c for c in record["result"]["annotation"]["conditions"] if c["condition_id"] == condition["id"])
                         prediction.update(state=c["status"], evidence=c["evidence"])
+                    if is_e3:
+                        prediction["uncertainty_context"] = record.get("result", {}).get("uncertainty_context", {}).get(condition["id"], [])
+                        prediction["derivation"] = [d for d in record.get("result", {}).get("derivation", [])
+                                                    if d["condition_id"] == condition["id"]]
                     predictions[mode] = prediction
                 queue.append({"id": row["id"], "condition": condition, "facts": row["facts"],
                               "predictions": predictions, "review_state": None, "review_notes": None,

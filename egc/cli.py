@@ -19,7 +19,8 @@ def run(args):
     if cmd == "facts-run":
         from .fact_experiment import run as run_facts
         return run_facts(read_rows(args.input), read_json(args.profile), args.output_dir,
-                         args.modes, args.model, args.limit, args.max_tokens, args.ask_key, args.dry_run)
+                         args.modes, args.model, args.limit, args.max_tokens, args.ask_key, args.dry_run,
+                         read_json(args.protocol) if args.protocol else None)
     if cmd == "facts-report":
         from .fact_experiment import report_run
         report = report_run(read_rows(args.input), args.run_dir, args.output,
@@ -141,7 +142,8 @@ def parser():
     q.add_argument("--input", required=True)
     q.add_argument("--profile", required=True)
     q.add_argument("--output-dir", required=True)
-    q.add_argument("--modes", nargs="+", choices=["joint", "flat", "bound", "flat_v2", "bound_v2"], default=["joint", "flat", "bound"])
+    q.add_argument("--modes", nargs="+", choices=["joint", "flat", "bound", "flat_v2", "bound_v2", "flat_e3", "bound_e3"], default=["joint", "flat", "bound"])
+    q.add_argument("--protocol", help="Required frozen cohort/config protocol for E3")
     q.add_argument("--model", default="deepseek-flash")
     q.add_argument("--limit", type=int, default=18, help="Maximum new HTTP requests, not cases; curl never retries")
     q.add_argument("--max-tokens", type=int, default=4096)

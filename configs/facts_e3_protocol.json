@@ -1,0 +1,21 @@
+{
+  "version": "fact-seven-context-e3-v1",
+  "stage": "E3_frozen_new_train_pilot_not_benchmark",
+  "source_hash": "7c32d6b3ea030124e9f32a755cfe929fba102ae2dd79d66eb1873831f0a9a157",
+  "profile_hash": "da0946d66fdede9532fe7b0c6efb2e4104626581f76e0df422df3b72d38ef2af",
+  "cases": 60,
+  "charges": {"诈骗罪": 30, "抢劫罪": 30},
+  "modes": ["flat_e3", "bound_e3"],
+  "model": "deepseek-flash",
+  "max_tokens": 4096,
+  "total_requests": 120,
+  "excluded_condition": "unsuccessful_completion",
+  "rules": [
+    "No additional tuning against the six E2 cases",
+    "Preserve E2 raw responses and rejected records",
+    "Uncertainty context is not supporting or refuting evidence",
+    "Review all seven conditions, including unknown and failed outputs",
+    "No semantic accuracy or H3 gain claimed from structural validity or agreement",
+    "No training release until independent data and rule checks"
+  ]
+}
