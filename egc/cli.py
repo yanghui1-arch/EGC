@@ -10,6 +10,20 @@ from .io import read_json, read_rows, write_json, write_rows
 
 def run(args):
     cmd = args.command
+    if cmd == "audit-inputs":
+        from .input_audit import audit
+        names = [str(Path(path).resolve()) for path in args.inputs]
+        if len(names) != len(set(names)):
+            raise ValueError("Do not pass the same input path twice")
+        out = Path(args.output_dir)
+        if out.exists() and any(out.iterdir()):
+            raise ValueError("Use a fresh audit output directory; do not overwrite review notes")
+        report, queue, overlaps = audit({name: read_rows(name) for name in names},
+            read_rows(args.focus_input) if args.focus_input else None, args.threshold)
+        write_json(out / "report.json", report)
+        write_rows(out / "review_queue.jsonl", queue)
+        write_json(out / "overlap_pairs.json", overlaps)
+        return report
     if cmd == "facts-prepare":
         from .fact_experiment import prepare
         report = prepare(read_rows(args.pool), [r for p in args.exclude for r in read_rows(p)],
@@ -130,6 +144,11 @@ def parser():
     def io(q):
         q.add_argument("--input", required=True)
         q.add_argument("--output", required=True)
+    q = command("audit-inputs", "USER RUN: review-only input risk and within/across-split overlap audit; no API")
+    q.add_argument("--inputs", nargs="+", required=True)
+    q.add_argument("--focus-input")
+    q.add_argument("--output-dir", required=True)
+    q.add_argument("--threshold", type=float, default=.85)
     q = command("facts-prepare", "USER RUN: freeze E2 regression and unexposed train cohorts; no API")
     q.add_argument("--pool", required=True)
     q.add_argument("--exclude", nargs="+", required=True)

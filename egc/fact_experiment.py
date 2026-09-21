@@ -51,6 +51,10 @@ def prepare(pool, exposed, regression, profile, output_dir, per_charge=30, seed=
             if overlap:
                 exclusions.append({"id": row["id"], **overlap})
                 continue
+            within = BenchmarkGuard(chosen + bucket).match(row["facts"])
+            if within:
+                exclusions.append({"id": row["id"], "overlap_scope": "within_selected_cohort", **within})
+                continue
             if fact_hash(row) in selected_hashes:
                 continue
             selected_hashes.add(fact_hash(row))
@@ -59,7 +63,7 @@ def prepare(pool, exposed, regression, profile, output_dir, per_charge=30, seed=
         chosen.extend(bucket)
     if not chosen:
         raise ValueError("No unexposed training cases remain")
-    manifest = {"version": facts.VERSION, "seed": seed, "profile_hash": digest(profile),
+    manifest = {"version": facts.VERSION, "selection_version": "cohort-within-near-v2", "seed": seed, "profile_hash": digest(profile),
         "pool_hash": digest(pool), "exposed_hash": digest(exposed),
         "regression_hash": digest(old), "new_hash": digest(chosen),
         "expectations_hash": digest(regression), "requested_per_charge": per_charge,

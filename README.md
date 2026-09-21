@@ -2,7 +2,7 @@
 
 **科研主记录：**[创新点、实验计划与进度](docs/RESEARCH_PLAN.md)。每次项目操作前查看，发生变化后更新；具体约定见[AGENTS.md](AGENTS.md)。历史实验报告保留原始结果。
 
-**当前可运行：**[E3七条件新样本验证](docs/RUN_FACTS_E3.md)，冻结60例×2组、最多120请求；85项离线测试通过，真实结果待用户运行。[E2第二轮结果](docs/E2_REGRESSION_V2_REPORT.md)为11结构通过/1格式拒绝，尚无绑定语义增益证据，不再重复6例提示迭代；[第一轮失败结果](docs/E2_REGRESSION_V1_REPORT.md)继续保留。
+**当前可运行：**[全候选池离线输入审计](docs/RUN_INPUT_AUDIT.md)，无API、无GPU，不修改输入和标签；91项离线软件测试通过。[E3实际结果](docs/E3_PILOT_REPORT.md)为120/120结构通过，420条件位置13处分歧，尚无绑定语义增益证据，暂选flat。因量刑建议漏筛及近重复，先复核输入，不重复E3、不放行训练。[E2失败结果](docs/E2_REGRESSION_V1_REPORT.md)及[第二轮报告](docs/E2_REGRESSION_V2_REPORT.md)继续保留。
 
 面向 LegalChainReasoner 的研究工程：把案情证据映射到法律条件，区分 supported / refuted / unknown，再组合基础规则、修正规则和例外，研究能否改善裁判理由生成与刑期预测。
 
@@ -13,7 +13,7 @@
 1. 已确认服务器两张A100 80GB，并跑通4B全参、8B LoRA小样例，无需重复安装环境。
 2. 改用CAIL官方训练数据，已建立12罪名1200条候选池（1080 train / 120 dev），不再依赖LAIC原生训练集。
 3. 已完成修订规范后的200条Flash试标：197条结构合格、3条拦截；随机审阅30条仍发现漏标和反证错误。完整候选池另隔离36条输入，现保留1047 train / 117 dev。当前不直接扩大联合标注提示，先拆分事实抽取与分析生成，见[200条审计报告](docs/PILOT_200_REPORT.md)。
-4. 同一模型比较 base、rules、concat、egc，再决定是否投入可训练链编码器。所有规则和超参数在 dev 上确定后再跑 test。
+4. E3已完成，暂选flat为默认抽取；先按当前命令审计输入池，复核并准备真实规则后，同一模型比较 base、rules、concat、egc，再决定是否投入可训练链编码器。所有规则和超参数在 dev 上确定后再跑 test。
 
 数据来源、实际试标结果与本机命令见 [CAIL与Flash标注](docs/DATA_AND_FLASH.md)。完整实验设计见 [研究计划](docs/RESEARCH_PLAN.md)，已发现的数据与复现问题见 [上游审计](docs/UPSTREAM_AUDIT.md)。
 
