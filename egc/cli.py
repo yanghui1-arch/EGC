@@ -10,6 +10,24 @@ from .io import read_json, read_rows, write_json, write_rows
 
 def run(args):
     cmd = args.command
+    if cmd == "apply-input-review":
+        from .input_review import apply_review
+        out = Path(args.output_dir)
+        if out.exists() and (not out.is_dir() or any(out.iterdir())):
+            raise ValueError("Use a fresh candidate output directory")
+        audit_dir = Path(args.audit_dir)
+        plan = read_json(args.decisions)
+        manifest, retained, quarantine, pending = apply_review(
+            {"train": read_rows(args.train), "dev": read_rows(args.dev)},
+            read_json(audit_dir / "report.json"), read_rows(audit_dir / "review_queue.jsonl"),
+            read_json(audit_dir / "overlap_pairs.json"), plan)
+        for split, rows in retained.items():
+            write_rows(out / f"candidate_{split}.jsonl", rows)
+        write_rows(out / "quarantine.jsonl", quarantine)
+        write_rows(out / "pending_review.jsonl", pending)
+        write_json(out / "review_plan.json", plan)
+        write_json(out / "manifest.json", manifest)
+        return manifest
     if cmd == "audit-inputs":
         from .input_audit import audit
         names = [str(Path(path).resolve()) for path in args.inputs]
@@ -144,6 +162,11 @@ def parser():
     def io(q):
         q.add_argument("--input", required=True)
         q.add_argument("--output", required=True)
+    q = command("apply-input-review", "USER RUN: apply hash-bound decisions into a new candidate snapshot; no API")
+    q.add_argument("--train", required=True); q.add_argument("--dev", required=True)
+    q.add_argument("--audit-dir", required=True); q.add_argument("--decisions", required=True)
+    q.add_argument("--output-dir", required=True)
+
     q = command("audit-inputs", "USER RUN: review-only input risk and within/across-split overlap audit; no API")
     q.add_argument("--inputs", nargs="+", required=True)
     q.add_argument("--focus-input")

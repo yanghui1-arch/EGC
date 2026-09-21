@@ -1,0 +1,59 @@
+{
+  "version": "assistant-input-review-v3-20260921",
+  "reviewer": "assistant_model_assisted_not_human_gold",
+  "input_hashes": {
+    "train": "983d7af916834cc4108049dfc663cc83f501965f3855ad0365a6c1a1b1667b1e",
+    "dev": "520747e1026040ae0f358d7717af3282bc446a9b82fa75933f5b2f38801c1f5e"
+  },
+  "audit_hashes": {
+    "report": "1fa495e551cef647814b2856273094fa743af8ebd72395a4037a9d7dc8c441db",
+    "queue": "788e3a3713500683a1cd8beb896ce1d24e72c30c930607d334ab1017e9878372",
+    "pairs": "12fd531466479d7599f18d087bb35177223037a4ad2af12ac7c711b3c8660d97"
+  },
+  "id_prefix": "cail2018_small:train:",
+  "quarantine_groups": {
+    "current_case_sentence_request": [
+      "f7fd23064152d5ba52b7", "f17b64ecb56c946b3673", "44a6ec4a9c5ecd020d8d", "cb8bcb18e8bc6f9a3cd6",
+      "e21d83e26d1514047404", "f52d896b2109fb07f1c1", "45748f7bc1b36f973229", "f0aa69a1d73ac2fbecc2",
+      "9e931e8d33973a768041", "c4833354597dae871229", "f0e5df75085447bf2d21", "a97b0fb0e857de12924f",
+      "75174d5d24c47307070f", "27ae78b6b0dd75720f00", "210c92e24727e078f576", "8bbf67809f21d11f597e",
+      "259e51ceeb63dd6046d0", "bf904ce1b2c23366a55f", "d72bea6904845ed4532c", "8e9c530fcb266a1a13e2",
+      "7a82670aba1ab9df84ca", "7b5ae0e7f890fd8e2b59", "33788103c9804d5a6ad3", "9520252e513f614c3836",
+      "30a185db3d7607082514", "bd3499431258aa1709b1", "1a3ed9adc489af3c9ff8", "afcce71cb840dd0dcd89",
+      "4916301a390d9b82228a", "8987786ffe5d02bee547", "44bb7fe6dce0feb1bde2", "bc60e7bdb9c21c621909",
+      "8a7355d8796c5e5b4230"
+    ],
+    "target_scope_unresolved": [
+      "a165af0927e807b6194a", "5a5c195059e05229ff93", "d6abff594582342f6b8a", "54089cf5c182fc17e353",
+      "fdb28d88ef11606ef162", "b4cf6f4784ca90e6cd3b", "707bde0a7b1b8fb6540e", "d8e3b27aa326bd72e2a6",
+      "f18faf685013fd46962d", "82084b0970609ff91936", "806ec17cb237ea7ade6c", "9d7195950182c0555721"
+    ],
+    "mixed_reasoning_requires_separation": [
+      "3b68c2ffc790dfab882b", "2e7393975539a785ca16", "1ac48abd30d37fdb3fe7", "9a39f84d54661eb397ef",
+      "bf393d9a86dd7b5266f1", "2dccdec8761859fb36fe", "d5a3f02c41db2b47bc7c", "48630c6f0d483736cabb",
+      "ec49bd72c2159f7fdeaa", "ab6d286073570b52e5f5", "a164527802b33f188a52", "4f855de119e07ef3b271",
+      "df417c77a9058603cf84", "b0cf0e52db9c0986aec9", "fa8d16d1a0651b6e0546", "ade008832cd274272202",
+      "12a25601c03e340aff22", "181b35704c23a47fbb01", "f5e808b84d2f9e617a34", "7f89b2aa05c599592c30",
+      "e70c474ef199216a5476", "4fe7a3dd2828db5f5620", "f45a6d3088ff3e77d36a", "da91efb9c74d9ea8eacf",
+      "09946d5bc8241b514c62"
+    ],
+    "source_label_text_conflict": ["20af0a63456bd7f9becc"],
+    "reviewed_near_duplicate": ["535bd8ba03b6010abd02", "263f290cd9aa487037c6"]
+  },
+  "dismissed_flag_kinds": {
+    "21478f1614a0a4565bf0": ["possible_sentence_hint"],
+    "d9383613c18ef4a3bcaf": ["possible_sentence_hint"]
+  },
+  "duplicate_links": [
+    {"excluded": "535bd8ba03b6010abd02", "representative": "1ac48abd30d37fdb3fe7"},
+    {"excluded": "263f290cd9aa487037c6", "representative": "b7915a09c5ada8a1a033"}
+  ],
+  "notes": [
+    "Only reviewed decisions are applied; quarantine is reversible and is not a finding that every isolated label is wrong.",
+    "The first duplicate representative is also quarantined for mixed reasoning; do not force it into training.",
+    "The two dismissed sentence flags concern a third-party historical case and a prior conviction. Other flags remain pending.",
+    "All 43 flagged robbery/fraud rows and three additional E3 scope cases were read; other reasoning/scope flags are not fully adjudicated.",
+    "Keep target-defendant scope unresolved where original metadata has one name but the model input contains multiple defendants.",
+    "No labels, facts, IDs, or split assignments may be rewritten. No training readiness is implied."
+  ]
+}
