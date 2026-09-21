@@ -1,5 +1,7 @@
 # 服务器操作
 
+当前真实数据下一步是[B0基础诊断](RUN_B0.md)：本机生成18条dev双组私有包后，服务器运行`CUDA_VISIBLE_DEVICES=0 bash scripts/server_b0.sh /mnt/yanghui/EGC/b0_jobs.zip`。它只用固定Qwen3-4B推理，不训练、不调用Flash。下方smoke与正式test/SFT示例保留作参考，本轮不要重跑。
+
 本机只做数据处理。下面模型相关命令均由用户在服务器执行；开发端没有连接服务器或运行模型。先从仓库根目录运行：
 
 ```bash
