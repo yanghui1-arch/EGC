@@ -2,7 +2,7 @@
 
 **科研主记录：**[创新点、实验计划与进度](docs/RESEARCH_PLAN.md)。每次项目操作前查看，发生变化后更新；具体约定见[AGENTS.md](AGENTS.md)。历史实验报告保留原始结果。
 
-**当前阶段：**[E4当前规则链方案已停止扩标/训练准备](docs/E4_INVENTORY_RESULT.md)。[B0本机打包→服务器推理→本机评估](docs/RUN_B0.md)已实现，112项离线测试通过。下一步用户在本机打包，再把私有包传到服务器、Git拉取代码，固定Qwen3-4B跑既有18条dev的两组共36次生成；零教师API、不训练。真实包/推理尚未运行，无benchmark提升。
+**当前阶段：**[B0真实结果已验收](docs/B0_RESULT.md)：两组共36条生成均为有效格式，MAE22.8333→22月，微小改善主要来自一案，不能支持H1/H2；仍有数值低估、归属和理由一致性问题。[E4复杂规则链仍停止](docs/E4_INVENTORY_RESULT.md)。下一步助手实现B1纯刑期监督基线，同格式冻结4B对全参SFT及train统计基线，无需Flash理由；专用入口尚待实现，用户无需重跑B0。暂无benchmark提升。
 
 面向 LegalChainReasoner 的研究工程：把案情证据映射到法律条件，区分 supported / refuted / unknown，再组合基础规则、修正规则和例外，研究能否改善裁判理由生成与刑期预测。
 
