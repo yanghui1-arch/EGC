@@ -2,9 +2,9 @@
 
 **科研主记录：**[创新点、实验计划与进度](docs/RESEARCH_PLAN.md)。每次项目操作前查看，发生变化后更新；具体约定见[AGENTS.md](AGENTS.md)。历史实验报告保留原始结果。
 
-**当前阶段：**[B0真实结果已验收](docs/B0_RESULT.md)：两组共36条生成均为有效格式，MAE22.8333→22月，微小改善主要来自一案，不能支持H1/H2；仍有数值低估、归属和理由一致性问题。[E4复杂规则链仍停止](docs/E4_INVENTORY_RESULT.md)。下一步助手实现B1纯刑期监督基线，同格式冻结4B对全参SFT及train统计基线，无需Flash理由；专用入口尚待实现，用户无需重跑B0。暂无benchmark提升。
+**当前阶段（2026-09-22）：**[Learned Evidence v1](docs/RUN_LEARNED.md)已实现：本机Flash语义审查/证据标注→私有实验包→服务器direct/flat/bound三组训练及dev评测。默认Qwen3-1.7B全参，不用关键词判罪或量刑规则。120项离线测试通过，尚无该轮真实API/GPU结果。原B1小样本计划由此替代；[B0](docs/B0_RESULT.md)不重跑，[E4复杂规则链](docs/E4_INVENTORY_RESULT.md)仍停止。不宣称已复现原编码器或获得benchmark提升。
 
-面向 LegalChainReasoner 的研究工程：把案情证据映射到法律条件，区分 supported / refuted / unknown，再组合基础规则、修正规则和例外，研究能否改善裁判理由生成与刑期预测。
+面向 LegalChainReasoner 任务的研究工程。当前检验学习原文证据和主体归属是否改善刑期预测；先前法律条件与组合规则代码仅保留作历史实验。
 
 当前是**提示层面的机制验证版本**，包含本机数据管线、DeepSeek 辅助标注、服务器全参/LoRA SFT、vLLM 推理和评估入口。训练规则：实际总参数量小于7B使用全参，7B及以上使用LoRA。Qwen3-4B全参和Qwen3-8B LoRA已在用户服务器完成虚构小样例的训练、保存、加载和推理；真实法律数据上的训练和benchmark提升尚未验证。尚未实现原论文神经链编码器和后续偏好训练。
 

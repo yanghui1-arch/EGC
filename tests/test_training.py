@@ -81,6 +81,8 @@ class TrainingTests(unittest.TestCase):
                 write_rows(root / "dev.jsonl", dev_rows)
                 args = parser().parse_args(["train", "--model", str(model_dir), "--training-mode", mode,
                          "--train", str(root / "train.jsonl"), "--dev", str(root / "dev.jsonl"), "--output", str(out)])
+                if mode == "full":
+                    args.checkpoint_selection = "final"
                 model = Mock()
                 model.num_parameters.side_effect = lambda only_trainable=False: count if mode == "full" or not only_trainable else 1234
                 tokenizer = tokenizer_fixture()
@@ -89,6 +91,7 @@ class TrainingTests(unittest.TestCase):
                 class Config:
                     # Reproduces the user's SFTConfig without chat_template_kwargs.
                     def __init__(self, completion_only_loss=None, **kwargs):
+                        captured["config"] = kwargs
                         if "chat_template_kwargs" in kwargs:
                             raise AssertionError("Unsupported SFTConfig argument")
 
@@ -121,6 +124,8 @@ class TrainingTests(unittest.TestCase):
                     train(args)
                 self.assertEqual(captured["export"], str(out / folder))
                 self.assertEqual("peft_config" in captured, mode == "lora")
+                self.assertEqual(captured["config"]["load_best_model_at_end"], mode == "lora")
+                self.assertEqual(captured["config"]["eval_strategy"], "no" if mode == "full" else "steps")
                 for sample in captured["train_dataset"] + captured["eval_dataset"]:
                     self.assertEqual(set(sample), {"input_ids", "attention_mask", "labels", "completion_mask"})
                     self.assertIn(-100, sample["labels"])

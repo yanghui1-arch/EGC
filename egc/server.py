@@ -175,8 +175,10 @@ def train(args):
                        max_length=args.max_length, completion_only_loss=True, packing=False,
                        bf16=bf16, fp16=not bf16, gradient_checkpointing=True,
                        gradient_checkpointing_kwargs={"use_reentrant": False},
-                       eval_strategy="steps", eval_steps=args.eval_steps, save_strategy="steps",
-                       save_steps=args.eval_steps, save_total_limit=2, load_best_model_at_end=True,
+                       eval_strategy="steps" if getattr(args, "checkpoint_selection", "dev_loss") == "dev_loss" else "no",
+                       eval_steps=args.eval_steps, save_strategy="steps",
+                       save_steps=args.eval_steps, save_total_limit=getattr(args, "save_total_limit", 2),
+                       load_best_model_at_end=getattr(args, "checkpoint_selection", "dev_loss") == "dev_loss",
                        metric_for_best_model="eval_loss", greater_is_better=False,
                        logging_steps=1, report_to=["tensorboard"], seed=args.seed, data_seed=args.seed,
                        ddp_find_unused_parameters=False)
@@ -238,6 +240,7 @@ def infer(args):
                 "rendered_prompts_hash": digest(prompts),
                 "max_new_tokens": args.max_new_tokens, "max_model_len": args.max_model_len,
                 "tensor_parallel": args.tensor_parallel, "batch_size": args.batch_size,
+                "dtype": getattr(args, "dtype", "auto"),
                 "weight_inventory": [{"file": str(p.relative_to(directory)), "bytes": p.stat().st_size,
                                        "mtime_ns": p.stat().st_mtime_ns}
                                       for directory in ([Path(model_path)] + ([adapter] if adapter else []))
@@ -259,6 +262,7 @@ def infer(args):
     os.environ["HF_HUB_OFFLINE"] = "1"
     os.environ["TRANSFORMERS_OFFLINE"] = "1"
     kwargs = {"model": model_path, "trust_remote_code": False, "tensor_parallel_size": args.tensor_parallel,
+              "dtype": getattr(args, "dtype", "auto"),
               "max_model_len": args.max_model_len, "gpu_memory_utilization": args.gpu_memory,
               "seed": args.seed, "enable_lora": adapter is not None}
     if adapter:

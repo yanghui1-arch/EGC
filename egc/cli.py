@@ -292,9 +292,12 @@ def parser():
     q.add_argument("--learning-rate", type=float, default=1e-5)
     q.add_argument("--precision", choices=["bf16", "fp16"], default="bf16")
     q.add_argument("--eval-steps", type=int, default=100)
+    q.add_argument("--save-total-limit", type=int, default=2)
     q.add_argument("--max-steps", type=int, default=-1)
     q.add_argument("--seed", type=int, default=42)
     q.add_argument("--resume")
+    q.add_argument("--checkpoint-selection", choices=["dev_loss", "final"], default="dev_loss",
+                   help="Use final for predeclared equal-epoch multi-task comparisons")
     q = command("infer", "SERVER ONLY: resumable vLLM inference, optional trained LoRA adapter")
     q.add_argument("--model", required=True)
     q.add_argument("--adapter")
@@ -305,6 +308,7 @@ def parser():
     q.add_argument("--max-new-tokens", type=int, default=1024)
     q.add_argument("--tensor-parallel", type=int, default=1)
     q.add_argument("--gpu-memory", type=float, default=0.85)
+    q.add_argument("--dtype", choices=["auto", "bfloat16", "float16"], default="auto")
     q.add_argument("--temperature", type=float, default=0.0)
     q.add_argument("--seed", type=int, default=42)
     return p

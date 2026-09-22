@@ -1,6 +1,6 @@
 # 服务器操作
 
-当前[B0真实诊断已完成](B0_RESULT.md)，无需重跑。下一步B1纯刑期监督基线入口及预算待助手实现；当前没有新的服务器命令。下方B0/smoke与正式test/SFT示例保留作参考，不代表已放行B1或正式训练。
+当前[B0真实诊断已完成](B0_RESULT.md)，无需重跑。新的完整训练入口为[Learned Evidence v1](RUN_LEARNED.md)：本机准备私有experiment.zip后，服务器运行`python -m egc.learned_server run --archive data/learned_v1/experiment.zip --output runs/learned_v1_qwen17_seed42`。默认Qwen3-1.7B全参，三组SFT及dev评测；本轮尚无真实GPU结果。下方B0/smoke与旧test/SFT示例保留作历史参考，当前以新运行文档为准。
 
 本机只做数据处理。下面模型相关命令均由用户在服务器执行；开发端没有连接服务器或运行模型。先从仓库根目录运行：
 
