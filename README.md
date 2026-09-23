@@ -1,5 +1,7 @@
 # EGC: Evidence-Grounded Chain Composition
 
+**实际进度（2026-09-23）：** v2已处理6000案，5613 keep/381 review/6 failed，原实验包5057/556一致性核验通过。抽样发现本案数字量刑提示漏筛，已补零API整案隔离工具，134项离线测试通过；用户下一步运行`python -m egc.learned_screen`，私传新包后服务器三组训练。见[实际验收与命令](docs/LEARNED_V2_RESULT.md)。预计4757 train/528 dev，真实新包尚待用户生成；不重新标注、不收紧主语规则，无新GPU结果。
+
 **最新方向（2026-09-23）：** `learned-context-v2`已实现：允许Flash从完整案情恢复跨句主体，取消同句/唯一引用/短字数硬筛；保留字段完整性、类型及原文来源检查，缺字段由模型重试、不补默认值。复用既有6000候选，新标注及包写入`data/learned_v2`，旧76案保留并在新轮统一重新标注。132项离线测试通过，尚无v2真实API/GPU结果。下一步见[运行命令](docs/RUN_LEARNED.md)和[方法设计](docs/CONTEXT_BINDING_DESIGN.md)。
 
 **科研主记录：**[创新点、实验计划与进度](docs/RESEARCH_PLAN.md)。每次项目操作前查看，发生变化后更新；具体约定见[AGENTS.md](AGENTS.md)。历史实验报告保留原始结果。
