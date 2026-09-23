@@ -1,5 +1,18 @@
 # Learned Evidence v1：先把训练对照跑起来
 
+**2026-09-23运行状态：先恢复已有失败，暂不扩标或训练。** 用户要求模型缺字段等问题重试，不用默认值补齐。已实现有界重试与本机密钥显示，126项离线测试通过。先停止旧进程，然后在本机运行：
+
+```powershell
+cd D:\workspace\codes\COLING\EGC
+python -m egc.learned annotate --retry-failed --failed-only --max-attempts 3 --limit 200 --workers 1 --ask-key --show-key
+```
+
+隐藏粘贴密钥后，程序将完整密钥直接显示在本机交互控制台，核对后输入y再发请求。不会通过程序stdout/stderr输出或写入缓存；输出重定向时拒绝show-key。终端画面会显示密钥，不要把该画面贴回聊天。401/403停止派发，与JSON/引用失败分别记录。
+
+每案最多3次总尝试（旧缓存初次调用计一次），本次最多200个新HTTP请求；成功keep/review跳过，不发送新案例。每次缺字段/JSON/原文校验失败，都把问题反馈给模型并重生成完整JSON。**没有代码补默认值，也不将无效主体自动改成null/unknown。** 到达尝试上限仍失败则隔离；超出预算的未完项可在后续显式续跑。保留`annotations/attempts/<请求指纹>/`中的原响应及重试请求，`000.json`为旧失败记录；不删除旧缓存。若进程中断导致某次发送结果不明，会标记deferred，不擅自重新收费。
+
+结果仍写`data/learned_v1/annotations/summary.json`。完成后告诉助手检查该文件和attempts；真实重试尚未执行。原诊断见[此文档](LEARNED_FIRST_RUN_DIAGNOSIS.md)，下面大批量入口暂作后续说明。
+
 2026-09-22。代码已实现，120项离线测试通过，包括合成源zip、模拟API缓存/预算、三组数据/标签核对、模拟完整服务器编排与续跑、失败打包和指标计算；尚未运行这轮真实抽样、Flash或GPU实验。研究结论仍以 [RESEARCH_PLAN.md](RESEARCH_PLAN.md) 为准。
 
 ## 原论文实际用了什么
@@ -34,7 +47,7 @@ Qwen-2.5-7B + LegalChainReasoner 在论文 LAIC 的 MAE/RMSE 为15.61/26.72月�
 - 排除LAIC/PCCD/CAIL三个冻结测试输入，以及既有v6 train/dev/隔离样本的精确及5-gram包含率≥0.85近重复；同轮样本亦去重。这个词面检查不能证明不存在语义/案件重叠。
 - Flash仅看到facts、给定charge、target_person，不见刑期、裁判理由、法条标签；判定keep/review并提供原文证据。输入污染/主体范围可疑的review、响应失败和无效引用都对三组共同隔离。**不改写事实，不重新标罪名或刑期，不把教师摘要叫作法院理由。**
 - 官方当前API名称是`deepseek-flash`，对应DeepSeek-V4.1-Flash（[2026-09-22核对](https://api-docs.deepseek.com/quick_start/pricing/)）。开启JSON，关闭thinking，每调用最多2048输出token，默认并发4，每次最多6000个新请求。保留响应模型版本、usage及缓存。
-- 6000只是调用上限；每案一次，不按实验臂重复。中断/异常不自动重付费。预算上界为6000×2048输出token，加输入token；实际费用以账户账单为准。
+- 6000是单次运行的总新HTTP调用上限，包含输出纠正重试，不按实验臂重复。每案默认总计3次；每次输出上限2048。网络交付不确定不会自动连发。预算上界为6000×2048输出token，加输入token；实际费用以账户账单为准。
 - 教师keep不是真正准确率。`teacher_review.jsonl`提供固定随机60例审查材料；可以完成探索训练后一起复核，不能未经审阅宣称清洗正确或机制成立。
 
 ## 本机运行（用户）
@@ -64,7 +77,7 @@ python -m egc.learned annotate --resolve-pending-as-failed --ask-key
 python -m egc.learned prepare
 ```
 
-异常缓存不自动重新请求；连续两批全部失败自动停止派发，缓存保留安全HTTP分类/状态码。大面积HTTP或格式失败时停止排查，不能把大量剔除后的结果当完整样本效果。任一划分保留不足一半或整个罪名消失时，prepare拒绝打包。
+旧失败缓存只有传入--retry-failed才会重新请求，且受累计尝试上限约束；已收到的无效响应在当次运行会进行有界纠正。连续两批最终全部失败停止派发，401/403立即停止新派发（在途调用可能已发送）。缓存保留安全HTTP分类/状态码。任一划分保留不足一半或整个罪名消失时，prepare拒绝打包。
 
 产物：
 

@@ -1,4 +1,4 @@
-param([int]$PerCharge = 500, [int]$Workers = 4)
+param([int]$PerCharge = 500, [int]$Workers = 4, [switch]$ShowKey, [switch]$RetryFailed)
 $ErrorActionPreference = 'Stop'
 if ($PerCharge -lt 10 -or $PerCharge -gt 500) { throw 'PerCharge must be 10..500 for this bounded first experiment.' }
 Set-Location (Split-Path $PSScriptRoot -Parent)
@@ -9,7 +9,10 @@ if (-not (Test-Path -LiteralPath 'data/learned_v1/pool/manifest.json')) {
     $poolConfig = Get-Content -LiteralPath 'data/learned_v1/pool/manifest.json' -Raw -Encoding UTF8 | ConvertFrom-Json
     if ($poolConfig.per_charge_cap -ne $PerCharge) { throw 'Existing pool has a different PerCharge; use explicit module commands with a fresh path.' }
 }
-python -m egc.learned annotate --workers $Workers --limit 6000 --ask-key
+$annotationArgs = @('-m', 'egc.learned', 'annotate', '--workers', "$Workers", '--limit', '6000', '--ask-key', '--max-attempts', '3')
+if ($ShowKey) { $annotationArgs += '--show-key' }
+if ($RetryFailed) { $annotationArgs += '--retry-failed' }
+python @annotationArgs
 if ($LASTEXITCODE -ne 0) { throw 'Annotation failed; cache is preserved. Do not delete pending requests.' }
 if (-not (Test-Path -LiteralPath 'data/learned_v1/ready/experiment.zip')) {
     python -m egc.learned prepare

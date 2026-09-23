@@ -15,6 +15,7 @@ import json
 import os
 from pathlib import Path
 import random
+import threading
 import zipfile
 
 from .annotate import ApiRequestError, call_deepseek
@@ -213,9 +214,13 @@ def validate(body, row):
 
 
 def annotate(input_dir, output, model="deepseek-flash", limit=6000, workers=4, ask_key=False, dry_run=False,
-             resolve_pending_as_failed=False):
+             resolve_pending_as_failed=False, max_attempts=3, retry_failed=False, show_key=False, failed_only=False):
     if not 1 <= workers <= 16 or limit <= 0:
         raise ValueError("Positive request bound; workers in 1..16")
+    if not 1 <= max_attempts <= 5:
+        raise ValueError("max_attempts must be 1..5, including the first request")
+    if failed_only and not retry_failed:
+        raise ValueError("--failed-only requires --retry-failed")
     rows = read_rows(Path(input_dir) / "train.jsonl") + read_rows(Path(input_dir) / "dev.jsonl")
     pool_manifest = read_json(Path(input_dir) / "manifest.json")
     for split in ("train", "dev"):
@@ -230,10 +235,19 @@ def annotate(input_dir, output, model="deepseek-flash", limit=6000, workers=4, a
     if (out / "identity.json").exists() and read_json(out / "identity.json") != identity:
         raise ValueError("Changed data/prompt/settings: choose a new annotation directory")
     pending, counts = [], Counter()
+    capped_failures = 0
     for row in rows:
         path = out / "cache" / (digest(payload(row, model)) + ".json")
         if path.exists():
-            counts[read_json(path)["status"]] += 1
+            saved = read_json(path)
+            if saved.get("id") != row["id"] or saved.get("input_hash") != digest(visible(row)) or saved.get("request_hash") != digest(payload(row, model)):
+                raise ValueError("Annotation cache identity mismatch before retry")
+            counts[saved["status"]] += 1
+            if retry_failed and saved["status"] == "failed":
+                if saved.get("attempts_used", 1) >= max_attempts:
+                    capped_failures += 1
+                else:
+                    pending.append((row, path))
         elif path.with_suffix(".pending.json").exists():
             if resolve_pending_as_failed and not dry_run:
                 write_json(path, {"id": row["id"], "status": "failed", "error_type": "UncertainRequestAbandoned",
@@ -241,21 +255,38 @@ def annotate(input_dir, output, model="deepseek-flash", limit=6000, workers=4, a
                 counts["failed"] += 1
             else:
                 counts["uncertain_request_no_automatic_retry"] += 1
-        else:
+        elif not failed_only:
             pending.append((row, path))
+    # Repair completed failures first; successful keep/review are never rebilled.
+    pending.sort(key=lambda pair: not pair[1].exists())
     planned = pending[:limit]
     if dry_run:
         return {"cases": len(rows), "new_requests": len(planned), "cached_status": dict(counts),
                 "not_yet_scheduled": max(0, len(pending)-limit), "max_output_tokens_per_call": 2048,
-                "max_new_output_tokens": 2048*len(planned), "no_api_calls": True}
-    key = (getpass.getpass("DeepSeek API key (hidden): ") if ask_key else os.environ.get("DEEPSEEK_API_KEY")) if planned else None
-    if planned and not key:
-        raise ValueError("Use --ask-key or set DEEPSEEK_API_KEY in this terminal")
+                "max_new_http_requests": limit, "max_attempts_per_case": max_attempts,
+                "max_new_output_tokens": 2048*min(limit, len(planned)*max_attempts), "no_api_calls": True}
+    cached_at_start = dict(counts)
+    print(f"Resume: cached_status={cached_at_start}; new_requests_planned={len(planned)}; "
+          f"not_yet_scheduled_after_limit={max(0, len(pending)-limit)}", flush=True)
+    from .credentials import read_key
+    key = read_key(ask_key, show_key) if planned else None
     write_json(out / "identity.json", identity)
+    write_json(out / "retry_protocol.json", {"version": "validated-retry-v1", "max_attempts": max_attempts,
+                "total_new_http_limit": limit, "retry_existing_failed": retry_failed,
+                "failed_only": failed_only,
+                "unchanged_validation": True, "default_field_imputation": False})
+    budget_lock, auth_stop = threading.Lock(), threading.Event()
+    http_requests = 0
 
-    def one(row, path):
-        request = payload(row, model)
-        write_json(path.with_suffix(".pending.json"), {"id": row["id"], "request_hash": digest(request)})
+    def claim_request():
+        nonlocal http_requests
+        with budget_lock:
+            if http_requests >= limit or auth_stop.is_set():
+                return False
+            http_requests += 1
+            return True
+
+    def request_once(row, request):
         envelope = []
         try:
             body, usage, metadata = call_deepseek(request, key, include_metadata=True, transport="curl",
@@ -267,28 +298,109 @@ def annotate(input_dir, output, model="deepseek-flash", limit=6000, workers=4, a
             result = {"status": "failed", "error_type": type(exc).__name__, "retry": "never_automatic"}
             if isinstance(exc, ApiRequestError):
                 result["diagnostic"] = exc.diagnostic
-        result.update(id=row["id"], input_hash=digest(visible(row)), request_hash=digest(request))
+            elif isinstance(exc, ValueError):
+                # Only fixed validator messages; never persist arbitrary exception text.
+                codes = {"annotation schema": "annotation_schema", "annotation decision": "annotation_decision",
+                         "annotation issues": "annotation_issues", "annotation summary": "summary_type_or_length",
+                         "annotation evidence": "evidence_type_or_length",
+                         "keep needs evidence/summary and no issues": "keep_fields",
+                         "review needs an issue": "review_without_issue", "evidence schema": "evidence_schema",
+                         "evidence must have unique verbatim source span": "quote_not_unique_verbatim_or_overlength",
+                         "evidence metadata": "evidence_metadata",
+                         "unlocated subject must remain uncertain": "null_subject_with_definite_relation",
+                         "subject must be present in the quoted source span": "subject_not_in_quote"}
+                result["validation_code"] = codes.get(str(exc), "response_decoding_or_other_validation")
+        result.update(id=row["id"], input_hash=digest(visible(row)), request_hash=digest(payload(row, model)),
+                      actual_request_hash=digest(request))
         if envelope:
             # Successful response metadata/content is private; omit all request headers.
             result["response"] = {k: envelope[-1].get(k) for k in ("id", "model", "choices", "usage")}
-        write_json(path, result)
-        return result["status"]
+        return result
+
+    def one(row, path):
+        previous = read_json(path) if path.exists() else None
+        previous_status = previous["status"] if previous else None
+        history = out / "attempts" / path.stem
+        history.mkdir(parents=True, exist_ok=True)
+        if previous and not any(history.glob("*.json")):
+            write_json(history / "000.json", previous)
+        complete = list(history.glob("[0-9][0-9][0-9].json"))
+        # A started attempt without a response cannot be safely retried automatically.
+        if any(not p.with_name(p.name.replace(".pending.json", ".json")).exists()
+               for p in history.glob("*.pending.json")):
+            return None, previous_status, "uncertain_attempt"
+        used, sent = len(complete), 0
+        while used < max_attempts and not auth_stop.is_set():
+            if not claim_request():
+                break
+            request = payload(row, model)
+            if previous and previous.get("response"):
+                choices = previous["response"].get("choices") or []
+                content = choices[0].get("message", {}).get("content") if choices else None
+                if isinstance(content, str) and content:
+                    request["messages"].append({"role": "assistant", "content": content})
+                code = previous.get("validation_code", "invalid_response_or_missing_fields")
+                request["messages"].append({"role": "user", "content":
+                    "上次响应未通过校验：" + code + "。请按原系统要求重新输出完整JSON，补齐所有规定字段。"
+                    "复核quote与subject的原文定位、类型及长度。不得由程序默认值代填，"
+                    "不得捏造主体或证据来通过校验；不要仅返回修改的字段。"})
+            number = used + 1
+            marker = history / f"{number:03d}.pending.json"
+            write_json(marker, {"id": row["id"], "request_hash": digest(request)})
+            write_json(path.with_suffix(".pending.json"), {"id": row["id"], "request_hash": digest(request)})
+            result = request_once(row, request)
+            sent += 1
+            used += 1
+            result.update(attempts_used=used, retry_policy="validated-retry-v1")
+            write_json(history / f"{number:03d}.json", {**result, "request": request})
+            write_json(path, result)
+            previous = result
+            if result["status"] != "failed":
+                break
+            diagnostic = result.get("diagnostic", {})
+            if diagnostic.get("category") == "http_status" and diagnostic.get("code") in {401, 403}:
+                auth_stop.set()
+                print(f"HTTP {diagnostic['code']}: authentication failed; stopping new requests. Recheck the entered key.", flush=True)
+                break
+            # Only confirmed model responses are eligible for automatic correction.
+            # Transport/timeout failures need an explicit future --retry-failed invocation.
+            if not result.get("response"):
+                break
+            if used < max_attempts:
+                print(f"Retrying invalid model response: case={row['id']}; next_attempt={used+1}/{max_attempts}; "
+                      f"code={result.get('validation_code', 'invalid_response')}", flush=True)
+        return previous["status"] if sent else None, previous_status, "completed" if sent else "budget_or_attempt_limit"
 
     attempted, failure_batches = 0, 0
+    current_counts = Counter()
+    deferred = Counter()
     with ThreadPoolExecutor(max_workers=workers) as executor:
         # Bound the in-flight queue too: persistent provider/schema failures must
         # not burn the entire nominal request allowance before the user sees them.
         for start in range(0, len(planned), workers):
             futures = [executor.submit(one, row, path) for row, path in planned[start:start+workers]]
-            statuses = [future.result() for future in as_completed(futures)]
-            counts.update(statuses)
+            results = [future.result() for future in as_completed(futures)]
+            deferred.update(reason for status, _, reason in results if status is None)
+            statuses = [s for s, _, _ in results if s is not None]
+            for status, old_status, _ in results:
+                if status is not None:
+                    if old_status:
+                        counts[old_status] -= 1
+                    counts[status] += 1
+            current_counts.update(statuses)
             attempted += len(statuses)
-            failure_batches = failure_batches + 1 if all(s == "failed" for s in statuses) else 0
-            print(f"Teacher requests completed: {attempted}/{len(planned)}; {dict(counts)}", flush=True)
+            failure_batches = failure_batches + 1 if statuses and all(s == "failed" for s in statuses) else 0
+            print(f"Teacher cases completed this run: {attempted}/{len(planned)}; HTTP requests={http_requests}/{limit}; "
+                  f"this_run_status={dict(current_counts)}; total_cached_status={dict(counts)}", flush=True)
+            if auth_stop.is_set() or http_requests >= limit:
+                break
             if failure_batches >= 2:
                 print("Stopped after two entirely failed request batches; inspect private caches before continuing.", flush=True)
                 break
-    report = {"version": VERSION, "cases": len(rows), "new_requests": attempted, "status": dict(counts),
+    report = {"version": VERSION, "cases": len(rows), "new_requests": http_requests, "cases_processed_this_run": attempted,
+              "status": dict(counts), "stopped_on_auth_error": auth_stop.is_set(),
+              "failed_only": failed_only, "capped_failures_not_retried": capped_failures, "deferred": dict(deferred),
+              "cached_status_at_start": cached_at_start, "this_run_status": dict(current_counts),
               "stopped_on_repeated_failures": failure_batches >= 2,
               "not_yet_scheduled": len(pending)-attempted, "semantic_accuracy": None,
               "note": "Format/source-span checks are not semantic validation; review/failed cases excluded from all arms"}
@@ -327,6 +439,10 @@ def prepare(input_dir, annotations, output, benchmarks=()):
             if not path.exists():
                 raise ValueError("Annotations not complete; rerun annotate to schedule remaining cases, inspect pending requests")
             cached = read_json(path)
+            history = annotation_path / "attempts" / path.stem
+            if history.exists() and any(not p.with_name(p.name.replace(".pending.json", ".json")).exists()
+                                       for p in history.glob("*.pending.json")):
+                raise ValueError("Unresolved interrupted retry; preserve evidence and resolve it before packaging")
             if cached.get("status") not in {"keep", "review", "failed"}:
                 raise ValueError("Unknown annotation status")
             if cached.get("id") != row["id"] or cached.get("input_hash") != digest(visible(row)) or cached.get("request_hash") != digest(request):
@@ -381,6 +497,7 @@ def prepare(input_dir, annotations, output, benchmarks=()):
                  "messages": messages(r, arm), "prompt_hash": digest(messages(r, arm))} for r in rows])
     manifest = {"version": VERSION, "arms": list(ARMS), "input_identity": identity,
                 "source_pool_manifest": read_json(pool_path / "manifest.json"),
+                "retry_protocol": read_json(annotation_path / "retry_protocol.json") if (annotation_path / "retry_protocol.json").exists() else None,
                 "retained": {s: len(pairs) for s, pairs in kept.items()}, "rejected": len(rejected),
                 "retained_by_charge": {s: dict(Counter(r["charge"] for r, _ in pairs)) for s, pairs in kept.items()},
                 "tests": tests, "test_used_for_selection": False, "teacher_semantic_accuracy": None,
@@ -415,6 +532,10 @@ def main():
     q.add_argument("--limit", type=int, default=6000)
     q.add_argument("--workers", type=int, default=4)
     q.add_argument("--ask-key", action="store_true")
+    q.add_argument("--show-key", action="store_true", help="Display the key only on the local interactive console and confirm it")
+    q.add_argument("--retry-failed", action="store_true", help="Revisit cached failures within the per-case attempt cap; preserve old responses")
+    q.add_argument("--failed-only", action="store_true", help="Retry existing failures only; send no requests for new cases")
+    q.add_argument("--max-attempts", type=int, default=3, help="Total attempts per case including the first request")
     q.add_argument("--dry-run", action="store_true")
     q.add_argument("--resolve-pending-as-failed", action="store_true",
                    help="Explicitly abandon interrupted requests without paying for a retry")
