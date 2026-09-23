@@ -10,7 +10,36 @@ from pathlib import Path
 from .io import digest, index_unique, read_json, read_rows, write_json, write_rows
 
 MODEL_ROOT = "/mnt/yanghui/models/Qwen"
-SFT_TOKENIZATION_VERSION = "explicit-no-thinking-v1"
+SFT_TOKENIZATION_VERSION = "explicit-no-thinking-qwen2-chatml-v2"
+QWEN2_CHAT_TEMPLATE = (
+    "{% for message in messages %}"
+    "{{ '<|im_start|>' + message['role'] + '\\n' + message['content'] + '<|im_end|>\\n' }}"
+    "{% endfor %}{% if add_generation_prompt %}{{ '<|im_start|>assistant\\n' }}{% endif %}"
+)
+
+
+def configure_chat(tokenizer, model_config):
+    """Use checkpoint formatting; support text-only Qwen2 ChatML if absent.
+
+    This is a serialization protocol, not a conversion of Base into Instruct.
+    Configure identically for preflight, training, frozen and adapter inference.
+    """
+    source = "checkpoint"
+    stop_ids = []
+    if model_config.get("model_type") == "qwen2":
+        for token, expected in (("<|im_start|>", 151644), ("<|im_end|>", 151645)):
+            if tokenizer.encode(token, add_special_tokens=False) != [expected]:
+                raise ValueError("Qwen2 ChatML special tokens do not match the checkpoint tokenizer")
+        if not tokenizer.chat_template:
+            tokenizer.chat_template = QWEN2_CHAT_TEMPLATE
+            source = "egc-qwen2-text-chatml-v1"
+        # Qwen2.5 Base can use endoftext as EOS while chat sequences end at im_end.
+        # Include im_end explicitly in inference, alongside the model's own EOS.
+        stop_ids = [151645]
+    if not tokenizer.chat_template:
+        raise ValueError("Checkpoint has no chat template and no supported Qwen2 serialization")
+    return {"source": source, "template_hash": digest(tokenizer.chat_template),
+            "stop_token_ids": stop_ids}
 
 
 def select_training_mode(parameter_count, requested="auto"):
@@ -117,7 +146,10 @@ def train(args):
     out = Path(args.output)
     if out.exists() and any(out.iterdir()) and not args.resume:
         raise ValueError("Nonempty run directory: use a new output or explicit --resume checkpoint")
+    tokenizer = AutoTokenizer.from_pretrained(model_path, local_files_only=True, trust_remote_code=False)
+    chat_protocol = configure_chat(tokenizer, read_json(Path(model_path) / "config.json"))
     identity = digest({"model": model_path, "model_config": read_json(Path(model_path) / "config.json"),
+                       "chat_protocol": chat_protocol,
                        "tokenization_version": SFT_TOKENIZATION_VERSION,
                        "train": train_rows, "dev": dev_rows,
                        "args": {k: v for k, v in vars(args).items() if k not in {"resume", "output"}}})
@@ -128,7 +160,6 @@ def train(args):
         checkpoint = Path(args.resume).resolve()
         if not checkpoint.is_dir() or not checkpoint.is_relative_to(out.resolve()):
             raise ValueError("Resume checkpoint must be an existing checkpoint inside this run directory")
-    tokenizer = AutoTokenizer.from_pretrained(model_path, local_files_only=True, trust_remote_code=False)
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "right"
@@ -196,6 +227,7 @@ def train(args):
                    "training_mode": training_mode, "total_parameters": total_parameters,
                    "trainable_parameters": trainable_parameters,
                    "tokenization_version": SFT_TOKENIZATION_VERSION,
+                   "chat_protocol": chat_protocol,
                    "tokenized_data_hash": digest(tokenized),
                    "args": {k: v for k, v in vars(args).items() if k != "func"},
                    "train_hash": digest(train_rows), "dev_hash": digest(dev_rows), "training_identity": identity,
@@ -228,6 +260,7 @@ def infer(args):
     if args.batch_size <= 0 or args.max_new_tokens <= 0 or args.max_new_tokens >= args.max_model_len:
         raise ValueError("Invalid inference batch or context limits")
     tokenizer = AutoTokenizer.from_pretrained(model_path, local_files_only=True, trust_remote_code=False)
+    chat_protocol = configure_chat(tokenizer, read_json(Path(model_path) / "config.json"))
     prompts = [render_chat(tokenizer, job["messages"]) for job in jobs]
     for job, prompt in zip(jobs, prompts):
         if len(tokenizer.encode(prompt, add_special_tokens=False)) + args.max_new_tokens > args.max_model_len:
@@ -238,6 +271,7 @@ def infer(args):
                 "adapter": str(adapter) if adapter else None, "adapter_config": adapter_config,
                 "jobs_hash": digest(jobs), "seed": args.seed, "temperature": args.temperature,
                 "rendered_prompts_hash": digest(prompts),
+                "chat_protocol": chat_protocol,
                 "max_new_tokens": args.max_new_tokens, "max_model_len": args.max_model_len,
                 "tensor_parallel": args.tensor_parallel, "batch_size": args.batch_size,
                 "dtype": getattr(args, "dtype", "auto"),
@@ -268,7 +302,8 @@ def infer(args):
     if adapter:
         kwargs["max_lora_rank"] = max(8, adapter_config["r"])
     engine = LLM(**kwargs)
-    sampling = SamplingParams(temperature=args.temperature, max_tokens=args.max_new_tokens, seed=args.seed)
+    sampling = SamplingParams(temperature=args.temperature, max_tokens=args.max_new_tokens, seed=args.seed,
+                              stop_token_ids=chat_protocol["stop_token_ids"] or None)
     request = LoRARequest("egc", 1, str(adapter)) if adapter else None
     write_json(str(output) + ".manifest.json", {"settings": settings, "generation_key": generation_key,
                                               "environment": environment(args.model, gpu=True)})

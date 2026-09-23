@@ -21,6 +21,8 @@ from .evaluate import compare, parse_output, summarize
 from .io import digest, index_unique, read_json, read_rows, write_json, write_rows
 from .learned import ARMS, VERSION, fresh, messages
 
+DEFAULT_MODEL = "/mnt/yanghui/models/Qwen/Qwen2.5-7B"
+
 
 def unpack(archive, output):
     with zipfile.ZipFile(archive) as bundle:
@@ -80,10 +82,9 @@ def validate_data(data):
 
 def preflight(data, model, max_length, output):
     from transformers import AutoTokenizer
-    from .server import render_chat, tokenize_sft_row
+    from .server import configure_chat, render_chat, tokenize_sft_row
     tokenizer = AutoTokenizer.from_pretrained(model, local_files_only=True, trust_remote_code=False)
-    if not tokenizer.chat_template:
-        raise ValueError("This checkpoint has no chat template; use a verified Qwen3 chat checkpoint for this protocol")
+    chat_protocol = configure_chat(tokenizer, read_json(Path(model) / "config.json"))
     report, too_long = {}, []
     for arm in ARMS:
         report[arm] = {}
@@ -103,7 +104,7 @@ def preflight(data, model, max_length, output):
             n = len(tokenizer.encode(render_chat(tokenizer, job["messages"]), add_special_tokens=False)) + 2048
             if n > max_length:
                 too_long.append({"id": job["id"], "arm": arm, "split": "dev_generation", "tokens": n})
-    write_json(output, {"arms": report, "overlength": too_long,
+    write_json(output, {"arms": report, "overlength": too_long, "chat_protocol": chat_protocol,
                         "note": "Equal examples/epochs, not equal supervised tokens; report this confound"})
     if too_long:
         raise ValueError("Overlength examples: inspect token_budget.json; no silent truncation or arm-specific exclusion")
@@ -257,7 +258,7 @@ def collect(run_dir):
     return str(destination)
 
 
-def run(archive, output, model="/mnt/yanghui/models/Qwen/Qwen3-1.7B", seed=42, epochs=3, max_length=8192, resume=False):
+def run(archive, output, model=DEFAULT_MODEL, seed=42, epochs=3, max_length=8192, resume=False):
     if platform.system() != "Linux":
         raise ValueError("Training/inference must run on the user's Linux GPU server")
     if epochs <= 0 or max_length <= 2048:
@@ -348,7 +349,7 @@ def main():
     q = sub.add_parser("run")
     q.add_argument("--archive", required=True)
     q.add_argument("--output", required=True)
-    q.add_argument("--model", default="/mnt/yanghui/models/Qwen/Qwen3-1.7B")
+    q.add_argument("--model", default=DEFAULT_MODEL)
     q.add_argument("--seed", type=int, default=42)
     q.add_argument("--epochs", type=float, default=3)
     q.add_argument("--max-length", type=int, default=8192)

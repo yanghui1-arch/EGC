@@ -1,5 +1,7 @@
 # EGC: Evidence-Grounded Chain Composition
 
+**当前首轮模型：Qwen2.5-7B，按实际参数>=7B采用LoRA。** 已统一预检/训练/推理模板和Qwen2聊天停止符，138项离线测试通过；数据包不重做。服务器运行见[Qwen2.5命令](docs/RUN_QWEN25.md)，真实GPU实验尚未运行。
+
 **实际进度（2026-09-23）：** v2已处理6000案，5613 keep/381 review/6 failed，原实验包5057/556一致性核验通过。抽样发现本案数字量刑提示漏筛，已补零API整案隔离工具，134项离线测试通过；用户下一步运行`python -m egc.learned_screen`，私传新包后服务器三组训练。见[实际验收与命令](docs/LEARNED_V2_RESULT.md)。预计4757 train/528 dev，真实新包尚待用户生成；不重新标注、不收紧主语规则，无新GPU结果。
 
 **最新方向（2026-09-23）：** `learned-context-v2`已实现：允许Flash从完整案情恢复跨句主体，取消同句/唯一引用/短字数硬筛；保留字段完整性、类型及原文来源检查，缺字段由模型重试、不补默认值。复用既有6000候选，新标注及包写入`data/learned_v2`，旧76案保留并在新轮统一重新标注。132项离线测试通过，尚无v2真实API/GPU结果。下一步见[运行命令](docs/RUN_LEARNED.md)和[方法设计](docs/CONTEXT_BINDING_DESIGN.md)。
