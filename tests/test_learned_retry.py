@@ -9,7 +9,7 @@ from unittest.mock import patch
 from egc.annotate import ApiRequestError
 from egc.credentials import read_key
 from egc.io import digest, read_json, write_json, write_rows
-from egc.learned import annotate, payload, visible, validation_issues
+from egc.learned import annotate, payload, visible, validation_issues_v1
 from test_learned import fixture, annotation
 
 
@@ -28,7 +28,7 @@ class RetryTests(unittest.TestCase):
             {"quote": quoted, "subject": "乙", "relation": "target", "kind": "action"},
             {"quote": "另一个片段。", "subject": None, "relation": "target", "kind": "outcome"}]}
         before = json.dumps(body)
-        issues = validation_issues(body, r)
+        issues = validation_issues_v1(body, r)
         self.assertEqual(json.dumps(body), before)
         self.assertEqual(len(issues), 3)
         self.assertEqual(issues[0], {"path": "evidence[0].quote", "problem": "too_long", "actual_chars": 162, "maximum_chars": 160})
@@ -131,7 +131,7 @@ class RetryTests(unittest.TestCase):
             root = Path(tmp)
             pool, rows = fixture(root)
             bad = annotation(rows[0])
-            bad["evidence"][0]["subject"] = "乙"
+            bad["evidence"][0]["subject"] = 12
             def api(request, key, **kwargs):
                 return response(bad, request, kwargs)
             with patch("egc.credentials.read_key", return_value="TEST_ONLY"), patch("egc.learned.call_deepseek", side_effect=api):
@@ -142,7 +142,7 @@ class RetryTests(unittest.TestCase):
             self.assertEqual(saved["attempts_used"], 3)
             self.assertNotIn("body", saved)
             preserved = json.loads(saved["response"]["choices"][0]["message"]["content"])
-            self.assertEqual(preserved["evidence"][0]["subject"], "乙")
+            self.assertEqual(preserved["evidence"][0]["subject"], 12)
             self.assertEqual(preserved["evidence"][0]["relation"], "target")
 
     def test_key_shown_only_to_direct_console_not_logging_streams(self):

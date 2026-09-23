@@ -1,8 +1,6 @@
 # EGC: Evidence-Grounded Chain Composition
 
-**最新方向：** 真实重试显示“同句quote必须含姓名”会误拒合法跨句指代。按用户建议转向[上下文主体恢复](docs/CONTEXT_BINDING_DESIGN.md)，新schema待实现，暂不继续v1付费重试。失败阶段/逐字段反馈/停止逻辑已修复，128项离线测试通过；无新GPU结果。
-
-**2026-09-23运行状态：**[首轮Flash标注失败诊断](docs/LEARNED_FIRST_RUN_DIAGNOSIS.md)后，按用户要求实现有界重试与本机密钥显示核对，126项离线测试通过。无默认值填充，不放宽校验。先按[运行文档顶部](docs/RUN_LEARNED.md)仅重试既有失败，暂不扩标/训练；真实恢复效果尚未验证。以下原交付状态保留作历史说明。
+**最新方向（2026-09-23）：** `learned-context-v2`已实现：允许Flash从完整案情恢复跨句主体，取消同句/唯一引用/短字数硬筛；保留字段完整性、类型及原文来源检查，缺字段由模型重试、不补默认值。复用既有6000候选，新标注及包写入`data/learned_v2`，旧76案保留并在新轮统一重新标注。132项离线测试通过，尚无v2真实API/GPU结果。下一步见[运行命令](docs/RUN_LEARNED.md)和[方法设计](docs/CONTEXT_BINDING_DESIGN.md)。
 
 **科研主记录：**[创新点、实验计划与进度](docs/RESEARCH_PLAN.md)。每次项目操作前查看，发生变化后更新；具体约定见[AGENTS.md](AGENTS.md)。历史实验报告保留原始结果。
 

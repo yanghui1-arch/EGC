@@ -168,19 +168,20 @@ def evidence_checks(rows, predictions, arm):
         evidence = body.get("evidence")
         if arm in {"direct", "frozen"}:
             continue
-        if not isinstance(evidence, list) or not 1 <= len(evidence) <= 6:
+        if not isinstance(evidence, list) or not evidence:
             counts["evidence_schema_failures"] += 1
             continue
         for item in evidence:
             counts["quotes"] += 1
             quote = item.get("quote") if isinstance(item, dict) else item
-            if isinstance(quote, str) and quote.strip() and refs[pred["id"]]["facts"].count(quote) == 1:
-                counts["unique_source_quotes"] += 1
+            if isinstance(quote, str) and quote.strip() and quote in refs[pred["id"]]["facts"]:
+                counts["source_quotes"] += 1
             if arm == "bound" and isinstance(item, dict):
                 subject = item.get("subject")
                 if isinstance(subject, str) and isinstance(quote, str) and subject and subject in quote:
                     counts["literal_subject_in_quote"] += 1
-    return dict(counts) | {"semantic_attribution_accuracy": None}
+    return dict(counts) | {"semantic_attribution_accuracy": None,
+                          "literal_subject_overlap_is_accuracy": False}
 
 
 def evaluate(data, run_dir, split="dev"):

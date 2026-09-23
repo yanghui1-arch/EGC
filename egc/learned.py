@@ -24,7 +24,8 @@ from .cail import BenchmarkGuard, charge_key, grams
 from .data import canonicalize, fact_hash, normalized_fact, split_train
 from .io import digest, index_unique, read_json, read_rows, write_json, write_rows
 
-VERSION = "learned-evidence-v1"
+VERSION = "learned-context-v2"
+POOL_VERSION = "learned-evidence-v1"  # Sampling and the existing 6000-case split are unchanged.
 ARMS = ("direct", "flat", "bound")
 ARCHIVE_SHA = "3c05dfdade742f8b0d5e782d174475e7769448a5f407bfb7f14f0aed72d61d4a"
 MEMBER = "final_all_data/exercise_contest/data_train.json"
@@ -35,13 +36,18 @@ TEACHER = """你是刑事案例研究的事实审查及证据标注器。材料�
 历史前科刑期不等于本案结果。不要因为仅出现另一人物就拒绝明确目标的案件。
 适用则decision=keep。两种决定都不能改写原文或补造事实，不评价原始刑期是否正确。
 keep时抽取最多6条与目标行为、后果、事后行为或不确定性有关的连续原文证据。
-quote必须是原文中唯一出现的连续字符串，长<=160字；必要时加原文上下文以消除重复。
-subject为该条证据明确的主体原文字符串，必须在quote中；无法可靠定位填null。
+quote直接摘录原文的连续片段，优先简短，也可以保留较长上下文；原文有重复不影响使用。
+subject是该事件的主体，允许根据完整facts的上下文、指代和省略恢复姓名或称谓，
+无需在quote中重复出现，也无需逐字照抄主体称谓；不要补充原文不支持的事实。
+例如“甲租用了仓库。随后购入材料。”可引用“随后购入材料。”，subject为“甲”。
+分清事件执行者、物品所有者、公司与自然人，警方查获不能把执行者写成被告人。
+确实无法判断主体时由你填写null，并根据上下文判断relation；程序不代填字段。
 relation为target/other/uncertain，无法确定归属选uncertain，不能将同案他人行为归给目标。
 kind为action/outcome/post_event/context。不要从报案、抓获、追缴、证据目录自动推断自首、坦白、退赔等。
-summary用不超过200字简述支持目标行为及其限制的事实，不给具体刑期，不虚构法律适用或裁判理由。
+summary简述支持目标行为及其限制的事实，建议200字左右；不因略超字数拒绝。
+不给具体刑期，不虚构法律适用或裁判理由。无需额外抄录单独的主体上下文，完整facts已提供。
 只输出JSON：{"decision":"keep|review","issues":["简短问题"],
-"evidence":[{"quote":"连续原文","subject":"原文主体或null","relation":"target|other|uncertain",
+"evidence":[{"quote":"连续原文","subject":"上下文主体或null","relation":"target|other|uncertain",
 "kind":"action|outcome|post_event|context"}],"summary":"事实摘要"}。
 keep必须有1至6条证据、非空摘要且issues为空。review可留空证据及摘要。
 """
@@ -157,7 +163,7 @@ def pool(archive, benchmarks, exclude, output, per_charge=500, seed=42):
     out = fresh(output)
     write_rows(out / "train.jsonl", train)
     write_rows(out / "dev.jsonl", dev)
-    manifest = {"version": VERSION, "archive_sha256": checksum, "member": MEMBER,
+    manifest = {"version": POOL_VERSION, "archive_sha256": checksum, "member": MEMBER,
                 "counts": dict(counts), "charges": dict(charges), "per_charge_cap": per_charge,
                 "train": len(train), "dev": len(dev), "seed": seed, "max_fact_chars": 2400,
                 "train_hash": digest(train), "dev_hash": digest(dev),
@@ -179,7 +185,7 @@ def payload(row, model):
             "temperature": 0, "max_tokens": 2048, "stream": False}
 
 
-def validate(body, row):
+def validate_v1(body, row):
     if not isinstance(body, dict) or set(body) != {"decision", "issues", "evidence", "summary"}:
         raise ValueError("annotation schema")
     if body["decision"] not in {"keep", "review"} or not isinstance(body["issues"], list) or len(body["issues"]) > 10:
@@ -213,7 +219,7 @@ def validate(body, row):
     return body
 
 
-def validation_issues(body, row):
+def validation_issues_v1(body, row):
     """Explain all structural errors without changing the response or gold labels."""
     issues = []
     def add(path, problem, **detail):
@@ -286,6 +292,72 @@ def validation_issues(body, row):
             add(p+".subject", "subject_mention_absent_from_this_quote",
                 requirement="Select a faithful contiguous source quote containing the subject mention within the existing length limit")
     return issues
+
+
+def validation_issues(body, row):
+    """V2: check usable JSON and source provenance, not semantic attribution.
+
+    Length, repeated source occurrences and literal subject matching are not
+    acceptance rules. No missing field or model value is repaired here.
+    """
+    issues = []
+    def add(path, problem, **detail):
+        issues.append({"path": path, "problem": problem, **detail})
+    def fields(value, required, path):
+        if not isinstance(value, dict):
+            add(path, "expected_JSON_object")
+            return False
+        if set(value) != required:
+            add(path, "wrong_fields", missing=sorted(required-set(value)), unexpected=sorted(set(value)-required))
+        return True
+    if not fields(body, {"decision", "issues", "evidence", "summary"}, "$"):
+        return issues
+    decision = body.get("decision")
+    if not isinstance(decision, str) or decision not in {"keep", "review"}:
+        add("decision", "expected_keep_or_review")
+    notes = body.get("issues")
+    if not isinstance(notes, list) or any(not isinstance(x, str) or not x.strip() for x in notes):
+        add("issues", "expected_list_of_nonempty_strings")
+    summary = body.get("summary")
+    if not isinstance(summary, str):
+        add("summary", "expected_string")
+    evidence = body.get("evidence")
+    if not isinstance(evidence, list):
+        add("evidence", "expected_list")
+    if decision == "keep":
+        if not evidence:
+            add("evidence", "keep_requires_at_least_one_item")
+        if not isinstance(summary, str) or not summary.strip():
+            add("summary", "keep_requires_nonempty_summary")
+        if notes:
+            add("issues", "keep_requires_empty_issues")
+    if decision == "review" and not notes:
+        add("issues", "review_requires_explanation")
+    for n, item in enumerate(evidence if isinstance(evidence, list) else []):
+        p = f"evidence[{n}]"
+        if not fields(item, {"quote", "subject", "relation", "kind"}, p):
+            continue
+        quote = item.get("quote")
+        if not isinstance(quote, str) or not quote.strip():
+            add(p+".quote", "expected_nonempty_string")
+        elif quote not in row["facts"]:
+            add(p+".quote", "quote_not_in_source", requirement="Copy a continuous original passage; recover subjects in subject, not by rewriting quote")
+        subject = item.get("subject")
+        if subject is not None and (not isinstance(subject, str) or not subject.strip()):
+            add(p+".subject", "expected_nonempty_string_or_null")
+        for field, allowed in (("relation", {"target", "other", "uncertain"}),
+                               ("kind", {"action", "outcome", "post_event", "context"})):
+            value = item.get(field)
+            if not isinstance(value, str) or value not in allowed:
+                add(p+"."+field, "invalid_enum", allowed=sorted(allowed))
+    return issues
+
+
+def validate(body, row):
+    issues = validation_issues(body, row)
+    if issues:
+        raise ValueError("annotation schema" if issues[0]["problem"] == "wrong_fields" else "annotation structure or source")
+    return body
 
 
 def response_issues(result, row):
@@ -371,7 +443,8 @@ def annotate(input_dir, output, model="deepseek-flash", limit=6000, workers=4, a
                 "failed_only": failed_only,
                 "feedback_version": "field-errors-v2", "transport_failure_stop": 8,
                 "consecutive_validation_failure_stop": 20,
-                "unchanged_validation": True, "default_field_imputation": False})
+                "annotation_protocol": VERSION, "validation": "structure_and_source_only",
+                "default_field_imputation": False})
     budget_lock, auth_stop = threading.Lock(), threading.Event()
     http_requests = 0
 
@@ -398,6 +471,7 @@ def annotate(input_dir, output, model="deepseek-flash", limit=6000, workers=4, a
             elif isinstance(exc, ValueError):
                 # Only fixed validator messages; never persist arbitrary exception text.
                 codes = {"annotation schema": "annotation_schema", "annotation decision": "annotation_decision",
+                         "annotation structure or source": "structure_or_source",
                          "annotation issues": "annotation_issues", "annotation summary": "summary_type_or_length",
                          "annotation evidence": "evidence_type_or_length",
                          "keep needs evidence/summary and no issues": "keep_fields",
@@ -445,7 +519,7 @@ def annotate(input_dir, output, model="deepseek-flash", limit=6000, workers=4, a
                     "上次响应未通过校验：" + code + "。全部可检测问题（索引从0开始）：" +
                     json.dumps(response_issues(previous, row), ensure_ascii=False) +
                     "。请逐条处理，再按原系统要求重新输出完整JSON，补齐所有规定字段。"
-                    "复核quote与subject的原文定位、类型及长度。不得由程序默认值代填，"
+                    "复核JSON字段和quote的原文来源；subject可以根据完整上下文恢复，不要求出现在quote里。不得由程序默认值代填，"
                     "不得捏造主体或证据来通过校验；不要仅返回修改的字段。"})
             number = used + 1
             marker = history / f"{number:03d}.pending.json"
@@ -533,7 +607,8 @@ def annotate(input_dir, output, model="deepseek-flash", limit=6000, workers=4, a
 def messages(row, arm):
     instruction = {"direct": '格式：{"reasoning":"事实依据及限制","sentence_months":整数}',
         "flat": '先生成最多6条原文证据，再给出结论。格式：{"evidence":["原文"],"reasoning":"事实依据及限制","sentence_months":整数}',
-        "bound": '先生成最多6条带主体归属的原文证据，再给出结论。subject须来自quote，无法定位用null及uncertain。'
+        "bound": '先生成最多6条带主体归属的原文证据，再给出结论。subject可以根据完整案情的指代和省略恢复，不必在quote中出现。'
+                 '区分事件执行者与物品所有者，不能混淆公司与自然人；无法判断时明确表达null/uncertain，不虚构事实。'
                  '格式：{"evidence":[{"quote":"原文","subject":"主体或null","relation":"target|other|uncertain",'
                  '"kind":"action|outcome|post_event|context"}],"reasoning":"事实依据及限制","sentence_months":整数}'}[arm]
     return [{"role": "system", "content": SYSTEM + instruction},
@@ -649,7 +724,7 @@ def main():
     q.add_argument("--seed", type=int, default=42)
     q = sub.add_parser("annotate")
     q.add_argument("--input-dir", default="data/learned_v1/pool")
-    q.add_argument("--output", default="data/learned_v1/annotations")
+    q.add_argument("--output", default="data/learned_v2/annotations")
     q.add_argument("--model", default="deepseek-flash")
     q.add_argument("--limit", type=int, default=6000)
     q.add_argument("--workers", type=int, default=4)
@@ -663,8 +738,8 @@ def main():
                    help="Explicitly abandon interrupted requests without paying for a retry")
     q = sub.add_parser("prepare")
     q.add_argument("--input-dir", default="data/learned_v1/pool")
-    q.add_argument("--annotations", default="data/learned_v1/annotations")
-    q.add_argument("--output", default="data/learned_v1/ready")
+    q.add_argument("--annotations", default="data/learned_v2/annotations")
+    q.add_argument("--output", default="data/learned_v2/ready")
     q.add_argument("--benchmarks", nargs="*", default=["data/processed/laic_test.jsonl", "data/processed/pccd_test.jsonl", "data/processed/cail_test.jsonl"])
     args = vars(p.parse_args())
     command = args.pop("command")

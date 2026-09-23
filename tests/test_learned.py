@@ -58,7 +58,7 @@ class LearnedTests(unittest.TestCase):
     def test_source_span_subject_and_uncertainty_validation(self):
         r = row()
         self.assertEqual(validate(annotation(r), r), annotation(r))
-        for field, value in (("quote", "杜撰证据"), ("subject", "乙"), ("subject", None), ("relation", "guilty")):
+        for field, value in (("quote", "杜撰证据"), ("subject", 12), ("relation", "guilty")):
             bad = annotation(r)
             bad["evidence"][0][field] = value
             with self.subTest(field=field, value=value), self.assertRaises(ValueError):

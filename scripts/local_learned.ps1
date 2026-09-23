@@ -14,9 +14,9 @@ if ($ShowKey) { $annotationArgs += '--show-key' }
 if ($RetryFailed) { $annotationArgs += '--retry-failed' }
 python @annotationArgs
 if ($LASTEXITCODE -ne 0) { throw 'Annotation failed; cache is preserved. Do not delete pending requests.' }
-if (-not (Test-Path -LiteralPath 'data/learned_v1/ready/experiment.zip')) {
+if (-not (Test-Path -LiteralPath 'data/learned_v2/ready/experiment.zip')) {
     python -m egc.learned prepare
     if ($LASTEXITCODE -ne 0) { throw 'Packaging failed; inspect incomplete annotations/pending requests.' }
 }
-Write-Host 'Send data/learned_v1/ready/experiment.zip privately to the server. No dataset/API cache goes to GitHub.'
-Write-Host 'Keep data/learned_v1/annotations/summary.json and data/learned_v1/ready/teacher_review.jsonl for review.'
+Write-Host 'Send data/learned_v2/ready/experiment.zip privately to the server. No dataset/API cache goes to GitHub.'
+Write-Host 'Keep data/learned_v2/annotations/summary.json and data/learned_v2/ready/teacher_review.jsonl for review.'
