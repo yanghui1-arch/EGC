@@ -8,8 +8,8 @@ from unittest.mock import patch
 
 from egc.annotate import ApiRequestError
 from egc.credentials import read_key
-from egc.io import digest, read_json, write_json
-from egc.learned import annotate, payload, visible
+from egc.io import digest, read_json, write_json, write_rows
+from egc.learned import annotate, payload, visible, validation_issues
 from test_learned import fixture, annotation
 
 
@@ -21,6 +21,38 @@ def response(body, request, kwargs):
 
 
 class RetryTests(unittest.TestCase):
+    def test_detailed_feedback_reports_all_fields_without_changing_output(self):
+        quoted = "甲" + "证"*160 + "。"
+        r = {"facts": quoted + "另一个片段。"}
+        body = {"decision": "keep", "issues": [], "summary": "摘要", "evidence": [
+            {"quote": quoted, "subject": "乙", "relation": "target", "kind": "action"},
+            {"quote": "另一个片段。", "subject": None, "relation": "target", "kind": "outcome"}]}
+        before = json.dumps(body)
+        issues = validation_issues(body, r)
+        self.assertEqual(json.dumps(body), before)
+        self.assertEqual(len(issues), 3)
+        self.assertEqual(issues[0], {"path": "evidence[0].quote", "problem": "too_long", "actual_chars": 162, "maximum_chars": 160})
+        self.assertEqual(issues[1]["path"], "evidence[0].subject")
+        self.assertEqual(issues[2]["path"], "evidence[1].subject")
+
+    def test_two_rejected_model_outputs_do_not_stop_single_worker(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            pool, rows = fixture(root)
+            extra = dict(rows[0], id="extra", facts="甲独立样本。", source_id="extra")
+            write_rows(pool / "train.jsonl", [rows[0], extra])
+            manifest = read_json(pool / "manifest.json")
+            manifest["train_hash"] = digest([rows[0], extra])
+            write_json(pool / "manifest.json", manifest)
+            def api(request, key, **kwargs):
+                return response({"decision": "keep"}, request, kwargs)
+            with patch("egc.credentials.read_key", return_value="TEST_ONLY"), patch("egc.learned.call_deepseek", side_effect=api) as call:
+                report = annotate(pool, root / "cache", max_attempts=1, workers=1, limit=10)
+            self.assertEqual(call.call_count, 3)
+            self.assertFalse(report["stopped_on_repeated_failures"])
+            self.assertEqual(report["this_run_failure_stages"], {"annotation_validation": 3})
+            self.assertEqual(report["stop_reason"], "eligible_cases_finished")
+
     def test_missing_fields_are_regenerated_not_imputed(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

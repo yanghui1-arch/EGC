@@ -213,6 +213,97 @@ def validate(body, row):
     return body
 
 
+def validation_issues(body, row):
+    """Explain all structural errors without changing the response or gold labels."""
+    issues = []
+    def add(path, problem, **detail):
+        issues.append({"path": path, "problem": problem, **detail})
+    if not isinstance(body, dict):
+        return [{"path": "$", "problem": "expected_JSON_object"}]
+    required = {"decision", "issues", "evidence", "summary"}
+    if set(body) != required:
+        add("$", "wrong_fields", missing=sorted(required-set(body)), unexpected=sorted(set(body)-required))
+    decision = body.get("decision")
+    if not isinstance(decision, str) or decision not in {"keep", "review"}:
+        add("decision", "expected_keep_or_review")
+    notes = body.get("issues")
+    if not isinstance(notes, list) or len(notes) > 10:
+        add("issues", "expected_list_max_10")
+    else:
+        for n, note in enumerate(notes):
+            if not isinstance(note, str) or not note.strip() or len(note) > 240:
+                add(f"issues[{n}]", "expected_nonempty_string_max_240_chars")
+    summary = body.get("summary")
+    if not isinstance(summary, str):
+        add("summary", "expected_string")
+    elif len(summary) > 200:
+        add("summary", "too_long", actual_chars=len(summary), maximum_chars=200)
+    evidence = body.get("evidence")
+    if not isinstance(evidence, list) or len(evidence) > 6:
+        add("evidence", "expected_list_max_6")
+    if decision == "keep":
+        if not evidence:
+            add("evidence", "keep_requires_at_least_one_item")
+        if not isinstance(summary, str) or not summary.strip():
+            add("summary", "keep_requires_nonempty_summary")
+        if notes:
+            add("issues", "keep_requires_empty_issues")
+    if decision == "review" and not notes:
+        add("issues", "review_requires_explanation")
+    seen = set()
+    for n, item in enumerate(evidence if isinstance(evidence, list) else []):
+        p = f"evidence[{n}]"
+        if not isinstance(item, dict):
+            add(p, "expected_object")
+            continue
+        fields = {"quote", "subject", "relation", "kind"}
+        if set(item) != fields:
+            add(p, "wrong_fields", missing=sorted(fields-set(item)), unexpected=sorted(set(item)-fields))
+        quote = item.get("quote")
+        if not isinstance(quote, str) or not quote.strip():
+            add(p+".quote", "expected_nonempty_string")
+        else:
+            if len(quote) > 160:
+                add(p+".quote", "too_long", actual_chars=len(quote), maximum_chars=160)
+            matches = row["facts"].count(quote)
+            if matches != 1:
+                add(p+".quote", "must_match_source_exactly_once", source_matches=matches)
+            if quote in seen:
+                add(p+".quote", "duplicate_evidence_item")
+            seen.add(quote)
+        subject, relation, kind = item.get("subject"), item.get("relation"), item.get("kind")
+        if not isinstance(relation, str) or relation not in {"target", "other", "uncertain"}:
+            add(p+".relation", "expected_target_other_or_uncertain")
+        if not isinstance(kind, str) or kind not in {"action", "outcome", "post_event", "context"}:
+            add(p+".kind", "expected_action_outcome_post_event_or_context")
+        if subject is None:
+            if relation != "uncertain":
+                add(p+".subject", "null_subject_but_definite_relation",
+                    requirement="Re-extract the actual source subject and quote; do not invent a name or blindly change relation")
+        elif not isinstance(subject, str) or not subject.strip():
+            add(p+".subject", "expected_nonempty_source_mention_or_null")
+        elif not isinstance(quote, str) or subject not in quote:
+            add(p+".subject", "subject_mention_absent_from_this_quote",
+                requirement="Select a faithful contiguous source quote containing the subject mention within the existing length limit")
+    return issues
+
+
+def response_issues(result, row):
+    """Also reconstruct detailed feedback for old caches that had only a generic code."""
+    choices = result.get("response", {}).get("choices") or []
+    if not choices:
+        return []
+    choice = choices[0]
+    if choice.get("finish_reason") not in {None, "stop"}:
+        return [{"path": "$", "problem": "incomplete_response", "requirement": "Return a shorter complete JSON within 2048 output tokens"}]
+    content = choice.get("message", {}).get("content")
+    try:
+        body = json.loads(content)
+    except (ValueError, TypeError):
+        return [{"path": "$", "problem": "invalid_JSON", "requirement": "Return one complete JSON object, no markdown"}]
+    return validation_issues(body, row)
+
+
 def annotate(input_dir, output, model="deepseek-flash", limit=6000, workers=4, ask_key=False, dry_run=False,
              resolve_pending_as_failed=False, max_attempts=3, retry_failed=False, show_key=False, failed_only=False):
     if not 1 <= workers <= 16 or limit <= 0:
@@ -235,6 +326,7 @@ def annotate(input_dir, output, model="deepseek-flash", limit=6000, workers=4, a
     if (out / "identity.json").exists() and read_json(out / "identity.json") != identity:
         raise ValueError("Changed data/prompt/settings: choose a new annotation directory")
     pending, counts = [], Counter()
+    cached_failure_stages = Counter()
     capped_failures = 0
     for row in rows:
         path = out / "cache" / (digest(payload(row, model)) + ".json")
@@ -243,6 +335,8 @@ def annotate(input_dir, output, model="deepseek-flash", limit=6000, workers=4, a
             if saved.get("id") != row["id"] or saved.get("input_hash") != digest(visible(row)) or saved.get("request_hash") != digest(payload(row, model)):
                 raise ValueError("Annotation cache identity mismatch before retry")
             counts[saved["status"]] += 1
+            if saved["status"] == "failed":
+                cached_failure_stages["annotation_validation" if saved.get("response") else "api_request"] += 1
             if retry_failed and saved["status"] == "failed":
                 if saved.get("attempts_used", 1) >= max_attempts:
                     capped_failures += 1
@@ -268,12 +362,15 @@ def annotate(input_dir, output, model="deepseek-flash", limit=6000, workers=4, a
     cached_at_start = dict(counts)
     print(f"Resume: cached_status={cached_at_start}; new_requests_planned={len(planned)}; "
           f"not_yet_scheduled_after_limit={max(0, len(pending)-limit)}", flush=True)
+    print(f"Cached failure stages: {dict(cached_failure_stages)}; annotation_validation means an API reply WAS received.", flush=True)
     from .credentials import read_key
     key = read_key(ask_key, show_key) if planned else None
     write_json(out / "identity.json", identity)
     write_json(out / "retry_protocol.json", {"version": "validated-retry-v1", "max_attempts": max_attempts,
                 "total_new_http_limit": limit, "retry_existing_failed": retry_failed,
                 "failed_only": failed_only,
+                "feedback_version": "field-errors-v2", "transport_failure_stop": 8,
+                "consecutive_validation_failure_stop": 20,
                 "unchanged_validation": True, "default_field_imputation": False})
     budget_lock, auth_stop = threading.Lock(), threading.Event()
     http_requests = 0
@@ -315,6 +412,10 @@ def annotate(input_dir, output, model="deepseek-flash", limit=6000, workers=4, a
         if envelope:
             # Successful response metadata/content is private; omit all request headers.
             result["response"] = {k: envelope[-1].get(k) for k in ("id", "model", "choices", "usage")}
+            if result["status"] == "failed":
+                result["validation_issues"] = response_issues(result, row)
+        if result["status"] == "failed":
+            result["failure_stage"] = "annotation_validation" if result.get("response") else "api_request"
         return result
 
     def one(row, path):
@@ -341,7 +442,9 @@ def annotate(input_dir, output, model="deepseek-flash", limit=6000, workers=4, a
                     request["messages"].append({"role": "assistant", "content": content})
                 code = previous.get("validation_code", "invalid_response_or_missing_fields")
                 request["messages"].append({"role": "user", "content":
-                    "上次响应未通过校验：" + code + "。请按原系统要求重新输出完整JSON，补齐所有规定字段。"
+                    "上次响应未通过校验：" + code + "。全部可检测问题（索引从0开始）：" +
+                    json.dumps(response_issues(previous, row), ensure_ascii=False) +
+                    "。请逐条处理，再按原系统要求重新输出完整JSON，补齐所有规定字段。"
                     "复核quote与subject的原文定位、类型及长度。不得由程序默认值代填，"
                     "不得捏造主体或证据来通过校验；不要仅返回修改的字段。"})
             number = used + 1
@@ -351,7 +454,7 @@ def annotate(input_dir, output, model="deepseek-flash", limit=6000, workers=4, a
             result = request_once(row, request)
             sent += 1
             used += 1
-            result.update(attempts_used=used, retry_policy="validated-retry-v1")
+            result.update(attempts_used=used, retry_policy="validated-retry-v1", feedback_version="field-errors-v2")
             write_json(history / f"{number:03d}.json", {**result, "request": request})
             write_json(path, result)
             previous = result
@@ -367,12 +470,17 @@ def annotate(input_dir, output, model="deepseek-flash", limit=6000, workers=4, a
             if not result.get("response"):
                 break
             if used < max_attempts:
-                print(f"Retrying invalid model response: case={row['id']}; next_attempt={used+1}/{max_attempts}; "
+                print(f"API reply received, annotation validation rejected: case={row['id']}; next_attempt={used+1}/{max_attempts}; "
                       f"code={result.get('validation_code', 'invalid_response')}", flush=True)
-        return previous["status"] if sent else None, previous_status, "completed" if sent else "budget_or_attempt_limit"
+        reason = "budget_or_attempt_limit"
+        if sent:
+            reason = "completed" if previous["status"] != "failed" else (
+                "validation_failure" if previous.get("response") else "transport_failure")
+        return previous["status"] if sent else None, previous_status, reason
 
-    attempted, failure_batches = 0, 0
+    attempted, transport_streak, validation_streak = 0, 0, 0
     current_counts = Counter()
+    current_failure_stages = Counter()
     deferred = Counter()
     with ThreadPoolExecutor(max_workers=workers) as executor:
         # Bound the in-flight queue too: persistent provider/schema failures must
@@ -382,26 +490,40 @@ def annotate(input_dir, output, model="deepseek-flash", limit=6000, workers=4, a
             results = [future.result() for future in as_completed(futures)]
             deferred.update(reason for status, _, reason in results if status is None)
             statuses = [s for s, _, _ in results if s is not None]
+            current_failure_stages.update("annotation_validation" if reason == "validation_failure" else "api_request"
+                                          for status, _, reason in results if status == "failed")
             for status, old_status, _ in results:
                 if status is not None:
                     if old_status:
                         counts[old_status] -= 1
                     counts[status] += 1
+            for status, _, reason in results:
+                if status is None:
+                    continue
+                transport_streak = transport_streak + 1 if reason == "transport_failure" else 0
+                validation_streak = validation_streak + 1 if reason == "validation_failure" else 0
             current_counts.update(statuses)
             attempted += len(statuses)
-            failure_batches = failure_batches + 1 if statuses and all(s == "failed" for s in statuses) else 0
             print(f"Teacher cases completed this run: {attempted}/{len(planned)}; HTTP requests={http_requests}/{limit}; "
-                  f"this_run_status={dict(current_counts)}; total_cached_status={dict(counts)}", flush=True)
+                  f"this_run_status={dict(current_counts)}; this_run_failure_stages={dict(current_failure_stages)}; "
+                  f"total_cached_status={dict(counts)}", flush=True)
             if auth_stop.is_set() or http_requests >= limit:
                 break
-            if failure_batches >= 2:
-                print("Stopped after two entirely failed request batches; inspect private caches before continuing.", flush=True)
+            if transport_streak >= 8:
+                print("Stopped after 8 consecutive transport/provider failures; inspect the connection/provider diagnostics.", flush=True)
+                break
+            if validation_streak >= 20:
+                print("Stopped after 20 consecutive cases still invalid after retries; inspect annotation protocol quality.", flush=True)
                 break
     report = {"version": VERSION, "cases": len(rows), "new_requests": http_requests, "cases_processed_this_run": attempted,
               "status": dict(counts), "stopped_on_auth_error": auth_stop.is_set(),
               "failed_only": failed_only, "capped_failures_not_retried": capped_failures, "deferred": dict(deferred),
               "cached_status_at_start": cached_at_start, "this_run_status": dict(current_counts),
-              "stopped_on_repeated_failures": failure_batches >= 2,
+              "cached_failure_stages_at_start": dict(cached_failure_stages),
+              "this_run_failure_stages": dict(current_failure_stages),
+              "stopped_on_repeated_failures": transport_streak >= 8 or validation_streak >= 20,
+              "stop_reason": "authentication" if auth_stop.is_set() else "transport_failures" if transport_streak >= 8
+                             else "validation_failures" if validation_streak >= 20 else "request_budget" if http_requests >= limit else "eligible_cases_finished",
               "not_yet_scheduled": len(pending)-attempted, "semantic_accuracy": None,
               "note": "Format/source-span checks are not semantic validation; review/failed cases excluded from all arms"}
     write_json(out / "summary.json", report)

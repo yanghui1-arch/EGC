@@ -215,9 +215,10 @@ class LearnedTests(unittest.TestCase):
             write_json(data / "manifest.json", {"train_hash": digest(rows), "dev_hash": digest(original[1:])})
             with patch.dict("os.environ", {"DEEPSEEK_API_KEY": "placeholder"}), patch("egc.learned.call_deepseek", side_effect=RuntimeError("unavailable")) as call:
                 report = annotate(data, root / "annotations", limit=10, workers=2)
-            self.assertEqual(call.call_count, 4)
+            self.assertEqual(call.call_count, 8)
             self.assertTrue(report["stopped_on_repeated_failures"])
-            self.assertEqual(report["not_yet_scheduled"], 6)
+            self.assertEqual(report["stop_reason"], "transport_failures")
+            self.assertEqual(report["not_yet_scheduled"], 2)
 
 
 if __name__ == "__main__":
