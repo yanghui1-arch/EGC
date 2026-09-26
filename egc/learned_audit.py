@@ -67,16 +67,18 @@ def audit(results, archive):
         valid[arm] = {r["id"] for r in summary["per_case"] if r["valid"]}
     common = set.intersection(*valid.values())
     shared_refs = [r for r in refs if r["id"] in common]
-    if not shared_refs:
-        raise ValueError("No shared-valid cases")
     shared_predictions = {a:[r for r in p if r["id"] in common] for a,p in predictions.items()}
     conditional, comparisons = {}, {}
     for arm,p in shared_predictions.items():
+        if not shared_refs:
+            conditional[arm] = {"n": 0, "mae": None, "rmse": None, "month_counts": {}}
+            continue
         s = summarize(shared_refs,p)
         conditional[arm] = {"n":s["n"],"mae":s["mae_months_full"],"rmse":s["rmse_months_full"],
                             "month_counts":dict(Counter(parse_output(x["text"])["sentence_months"] for x in p))}
     for first,second in (("frozen","direct"),("direct","flat"),("flat","bound")):
-        comparisons[f"{second}_vs_{first}"] = compare(shared_refs,shared_predictions[first],shared_predictions[second])
+        comparisons[f"{second}_vs_{first}"] = (compare(shared_refs,shared_predictions[first],shared_predictions[second])
+            if shared_refs else {"eligible": False, "reason": "no_shared_valid_cases"})
     return {"provenance_and_original_metrics":"PASS", "model":execution["model"],
             "git_commit":execution["git_commit"],"retained":manifest["retained"],
             "original_metrics":original, "shared_valid_diagnostic":conditional,

@@ -182,6 +182,9 @@ class LearnedTests(unittest.TestCase):
                     artifact = out / "model"
                     artifact.mkdir(parents=True)
                     write_json(out / "completion.json", {"complete": True, "training_mode": "full", "artifact": str(artifact)})
+                    write_json(out / "run_manifest.json", {
+                        f"{split}_hash": digest(read_rows(cmd[cmd.index(f"--{split}")+1]))
+                        for split in ("train", "dev")})
                 else:
                     jobs = read_rows(cmd[cmd.index("--jobs")+1])
                     settings = {"jobs_hash": digest(jobs), "model": cmd[cmd.index("--model")+1],
@@ -200,6 +203,19 @@ class LearnedTests(unittest.TestCase):
                 self.assertEqual(sum(cmd[3] == "train" for cmd in calls), 3)
                 with self.assertRaisesRegex(ValueError, "same code"):
                     run(root / "ready/experiment.zip", root / "run", model=str(root / "model"), seed=43, resume=True)
+            from egc.learned_audit import audit
+            self.assertEqual(audit(result["results"], root / "ready/experiment.zip")["shared_valid_diagnostic"]["bound"]["n"], 1)
+            for path in (root / "run").glob("*.predictions.jsonl"):
+                predictions = read_rows(path)
+                for prediction in predictions:
+                    prediction["text"] += " trailing invalid output"
+                write_rows(path, predictions)
+            evaluate(root / "run/data", root / "run")
+            audited = audit(collect(root / "run"), root / "ready/experiment.zip")
+            self.assertEqual(audited["provenance_and_original_metrics"], "PASS")
+            self.assertEqual(audited["original_metrics"]["bound"]["valid"], 0)
+            self.assertIsNone(audited["shared_valid_diagnostic"]["bound"]["mae"])
+            self.assertEqual(audited["posthoc_comparisons"]["bound_vs_flat"]["reason"], "no_shared_valid_cases")
             with patch("egc.learned_server.platform.system", return_value="Linux"), patch("egc.learned_server.preflight", side_effect=ValueError("too long")):
                 with self.assertRaisesRegex(ValueError, "too long"):
                     run(root / "ready/experiment.zip", root / "failed", model=str(root / "model"))
