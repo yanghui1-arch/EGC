@@ -1,5 +1,7 @@
 # Qwen2.5-7B：训练完成，生成结束异常，方法比较不可用
 
+**2026-09-27最新进展：CPU诊断已完成，不再重复下方历史CPU命令。** 下一步是本文末尾的两例Transformers生成对照，复用direct adapter，不训练。
+
 2026-09-26只读验收用户回传的`runs/results_qwen25_7b_seed42.zip`。该包证明此前目录冲突之后，任务最终完成；不推断用户如何处理旧目录。
 
 ## 核验事实
@@ -48,3 +50,26 @@ python -m egc.diagnose_qwen_stop \
 用户回传`runs/qwen25_stop_diagnostic.json`。若运行目录已改名，使用保存本次execution.json的实际目录。保留原adapter和全部结果。根据诊断决定修正训练结束标记/输出层或做少量跨引擎对照；不盲目重跑三组、不增加token上限、不把异常字符写成针对本批结果的停止规则。正式test继续冻结；H4仍未获支持，1.7B的负面绑定证据保留。
 
 本次软件修复仅让`learned_audit`在共同有效集合为空时返回空指标与明确不可比较原因，原评估器、模型训练和推理代码未改。13项相关离线测试通过，包括模拟正/零覆盖审计及向量相等诊断；真实结果只读审计通过。诊断入口帮助检查通过，服务器权重诊断待用户执行，不能把合成测试称为实际根因验证。
+
+## 2026-09-27：CPU实测与下一步
+
+用户回传`runs/qwen25_stop_diagnostic.json`，SHA256为`98d726a3fd3cde96907d649eecfec13af935d66730c1b8e7806e2b771d350de9`。run提交、模型路径、三个adapter配置与原结果包一致。
+
+- 三个adapter的词表和模板均与基座一致，EOS均为151643；不支持tokenizer保存后发生错位的解释。
+- `𬭤`为token123352，`䏡`为122500。其lm_head行与im_end151645行均**不完全相同**，最大逐元素绝对差分别0.004241943359375和0.01910400390625。此前针对这两个异常字符的“完全相同输出行”猜测未获支持。
+- im_start151644与im_end151645的lm_head行最大差为0.00006103515625，embedding最大差为2.350988701644575e-37。这里只证明数值差异很小；没有隐藏状态/logit测量，不能据此断言模型无法区分或证明根因。未扫描整个词表，亦未验证vLLM实现。
+
+实现了同一诊断入口的`--generate`模式：从原direct dev任务文件固定取前两条，不按参考刑期选样；核验原预测指纹、模型/adapter配置、权重文件清单及渲染prompt hash。用Transformers+PEFT加载已有direct adapter，bf16、greedy、相同2048输出上限、EOS及im_end停止条件，生成两次。另在原vLLM输出的首个JSON边界做两次前向计算，记录停止token及异常字符的logit排名。只读取推理任务与原预测，不读取刑期参考、不计算MAE、不替换原始结果、不修改磁盘权重。
+
+```bash
+cd /mnt/yanghui/EGC
+git pull --ff-only
+CUDA_VISIBLE_DEVICES=0 python -m egc.diagnose_qwen_stop \
+  --generate \
+  --run-dir runs/learned_v2_screened_qwen25_7b_seed42 \
+  --output runs/qwen25_generation_probe.json
+```
+
+将`runs/qwen25_generation_probe.json`回传本机runs目录。生成使用GPU 0；CPU诊断无需重做。该检查存在引擎数值和批大小差异，2例结果只用于定位：若Transformers也续写，优先修正训练终止协议/输出层；若能正常终止，进一步检查vLLM LoRA路径，暂不重训。任一分支均不能凭2例宣称全dev已经修复。
+
+相关14项离线测试通过，涵盖原审计、词表/格式适配、向量比较和JSON边界定位；GPU探针尚待服务器实际运行。API调用方式参考[Transformers生成文档](https://huggingface.co/docs/transformers/main/en/main_classes/text_generation)与[PEFT已训练adapter加载文档](https://huggingface.co/docs/peft/main/en/package_reference/peft_model#from_pretrained)。本轮无新增训练或方法效果，H4仍未获支持。
