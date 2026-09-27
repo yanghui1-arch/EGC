@@ -8,7 +8,7 @@ from unittest.mock import Mock, patch
 from egc.cli import parser
 from egc.io import digest, read_json, write_json, write_rows
 from egc.learned_server import DEFAULT_MODEL, run
-from egc.server import configure_chat, infer, QWEN2_CHAT_TEMPLATE
+from egc.server import configure_chat, infer, tokenize_sft_row, QWEN2_CHAT_TEMPLATE
 
 
 def tokenizer(template=None):
@@ -20,6 +20,36 @@ def tokenizer(template=None):
 
 
 class Qwen25Tests(unittest.TestCase):
+    def test_base_native_eos_supervised_and_prompt_preserved(self):
+        t = tokenizer("native template")
+        t.eos_token_id = 151643
+        markers = {"<|im_start|>": 151644, "<|im_end|>": 151645, "<|endoftext|>": 151643}
+        def encode(text, **kwargs):
+            import re
+            ids = []
+            for part in re.split(r"(<\|(?:im_start|im_end|endoftext)\|>)", text):
+                ids.extend([markers[part]] if part in markers else map(ord, part))
+            return ids
+        t.encode.side_effect = encode
+        protocol = configure_chat(t, {"model_type": "qwen2", "eos_token_id": 151643})
+        prefix = "<|im_start|>user\nquestion<|im_end|>\n<|im_start|>assistant\n"
+        row = {"id": "synthetic", "prompt": [{"role": "user", "content": "question"}],
+               "completion": [{"role": "assistant", "content": "answer"}]}
+        t.apply_chat_template.side_effect = lambda messages, **kw: prefix if kw["add_generation_prompt"] else prefix + "answer<|im_end|>\n"
+        result = tokenize_sft_row(t, row, protocol)
+        self.assertEqual(result["input_ids"][:len(encode(prefix))], encode(prefix))
+        self.assertEqual(result["labels"][:len(encode(prefix))], [-100] * len(encode(prefix)))
+        self.assertEqual(result["labels"][len(encode(prefix)):], encode("answer<|endoftext|>"))
+        unchanged = configure_chat(t, {"model_type": "qwen2", "eos_token_id": 151645})
+        self.assertIsNone(unchanged["completion_end_token"])
+        self.assertEqual(tokenize_sft_row(t, row, unchanged)["input_ids"], encode(prefix + "answer<|im_end|>\n"))
+        t.apply_chat_template.side_effect = lambda messages, **kw: prefix if kw["add_generation_prompt"] else prefix + "answer"
+        with self.assertRaisesRegex(ValueError, "assistant ChatML"):
+            tokenize_sft_row(t, row, protocol)
+        t.eos_token_id = 99
+        with self.assertRaisesRegex(ValueError, "native EOS"):
+            configure_chat(t, {"model_type": "qwen2", "eos_token_id": 151643})
+
     def test_default_and_native_template_are_preserved(self):
         self.assertTrue(DEFAULT_MODEL.endswith("/Qwen2.5-7B"))
         self.assertEqual(run.__defaults__[0], DEFAULT_MODEL)

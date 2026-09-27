@@ -1,6 +1,6 @@
 # Qwen2.5-7B：训练完成，生成结束异常，方法比较不可用
 
-**2026-09-27最新进展：CPU诊断已完成，不再重复下方历史CPU命令。** 下一步是本文末尾的两例Transformers生成对照，复用direct adapter，不训练。
+**2026-09-27最新进展：CPU和两例GPU探针均已完成，下方旧命令无需再执行。** 两例Transformers生成同样失败，当前下一步为[32步原生EOS修复小试](RUN_QWEN25.md)，真实修复效果待验证。
 
 2026-09-26只读验收用户回传的`runs/results_qwen25_7b_seed42.zip`。该包证明此前目录冲突之后，任务最终完成；不推断用户如何处理旧目录。
 
@@ -73,3 +73,20 @@ CUDA_VISIBLE_DEVICES=0 python -m egc.diagnose_qwen_stop \
 将`runs/qwen25_generation_probe.json`回传本机runs目录。生成使用GPU 0；CPU诊断无需重做。该检查存在引擎数值和批大小差异，2例结果只用于定位：若Transformers也续写，优先修正训练终止协议/输出层；若能正常终止，进一步检查vLLM LoRA路径，暂不重训。任一分支均不能凭2例宣称全dev已经修复。
 
 相关14项离线测试通过，涵盖原审计、词表/格式适配、向量比较和JSON边界定位；GPU探针尚待服务器实际运行。API调用方式参考[Transformers生成文档](https://huggingface.co/docs/transformers/main/en/main_classes/text_generation)与[PEFT已训练adapter加载文档](https://huggingface.co/docs/peft/main/en/package_reference/peft_model#from_pretrained)。本轮无新增训练或方法效果，H4仍未获支持。
+
+## 2026-09-27：GPU实测与有界修复实验
+
+用户回传`runs/qwen25_generation_probe.json`，SHA256为`e529d158a78abeaabee077c3857e88747ec42997e03a594b875f19702c7e4a90`。选中ID及嵌入的原vLLM记录与原结果包direct前两条完全一致；运行提交58880be、模型/adapter配置和渲染prompt身份相符。Transformers 5.17.0、PEFT 0.20.0，用原adapter、bf16、greedy、2048上限，停止列表151643/151645。
+
+| 案例ID后缀 | Transformers结果 | 原JSON边界im_end排名 | 原生EOS排名 |
+|---|---|---:|---:|
+| 522ea8d6008aa0df1b63 | length，2048，JSON后继续生成 | 131 | 12676 |
+| c4a3456f9381f3ec2b59 | length，2048，JSON后继续生成 | 149 | 13024 |
+
+第一例边界最高logit为11.625（包含`:UIButtonType`），im_end为10.375；第二例最高为异常字符𬭤的11.75，im_end为10.4375。两引擎尾随文本不完全相同，但均未正常终止。该有限对照支持模型侧终止学习失败，不能只解释为vLLM忽略了停止设置，也不证明输出层在数学上无法学会im_end。原始1584条失败仍保留，未补算刑期分数。
+
+本轮修复是待验证的工程选择：Qwen2 Base本地config和tokenizer均以151643为EOS时，仅将训练序列最后assistant的`<|im_end|>`及其尾随换行替换为`<|endoftext|>`。保留全部输入ChatML、JSON正文、attention LoRA范围、学习率等超参；不解冻输出层、不把乱码设为停止符、不截取JSON追分。其他模型和以im_end为EOS的Qwen2 Instruct维持原终止序列。预检和训练共用分词函数，新协议`explicit-no-thinking-qwen2-native-eos-v3`进入身份记录；旧实验不得续跑混用。还在训练开始前核验真实TRL collator没有把EOS当PAD屏蔽。
+
+实现`egc.qwen_eos_smoke`复用现有解包、训练、推理、指纹验证和结果收集函数。服务器从基座新训direct 32个优化步，随后按既定dev顺序每罪名首条共12条生成；选样仅读取给定罪名，不看参考刑期。仍用原完整训练包4757/528、seed42、lr1e-5、rank64、max8192和2048生成上限。这里的32步只是低成本软件/终止行为检查，不是充分收敛实验；失败不能直接否定原生EOS路线。12/12完整JSON并正常停止才放行新协议三组完整dev复核，通过亦不代表全dev成功或刑期准确率提升。正式test冻结，H4无新支持证据。
+
+142项离线测试通过，包括新协议的输入保留/EOS监督、非Base格式保留、模拟32步调度及成功/截断门槛、结果包排除权重。没有在本机运行真实训练、模型推理或API；实际小试待用户按RUN_QWEN25执行并回传结果包。

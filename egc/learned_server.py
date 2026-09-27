@@ -93,7 +93,7 @@ def preflight(data, model, max_length, output):
             lengths = []
             labels = 0
             for row in rows:
-                tokens = tokenize_sft_row(tokenizer, row)
+                tokens = tokenize_sft_row(tokenizer, row, chat_protocol)
                 lengths.append(len(tokens["input_ids"]))
                 labels += sum(tokens["completion_mask"])
                 if lengths[-1] > max_length:

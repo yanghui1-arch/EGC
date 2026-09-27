@@ -1,5 +1,21 @@
 # 首轮改用Qwen2.5-7B
 
+**2026-09-27当前执行：先运行原生EOS修复小试，下方旧全量命令仅作历史记录。** 两例Transformers探针也达到2048上限，详见[诊断结果](QWEN25_DEV_RESULT.md)。下面只从Qwen2.5-7B基座新训direct 32步、生成12个固定dev案例，不使用旧adapter继续训练，不调用API：
+
+```bash
+cd /mnt/yanghui/EGC
+git pull --ff-only
+CUDA_VISIBLE_DEVICES=0 python -m egc.qwen_eos_smoke \
+  --archive data/learned_v2_screened/experiment.zip \
+  --output runs/qwen25_native_eos_smoke_seed42
+```
+
+默认模型为`/mnt/yanghui/models/Qwen/Qwen2.5-7B`；保持rank64/alpha128/dropout0.05、lr1e-5、batch1×累积16、max8192、seed42及2048生成上限。唯一格式修改是最终assistant结束符改为本地Base原生EOS endoftext；输入ChatML和答案正文保持不变。输出目录须新建，不能对旧实验使用resume。原生EOS监督和实际TRL collator检查通过后才训练。
+
+把服务器`/mnt/yanghui/EGC/runs/qwen25_native_eos_smoke_seed42/results.zip`私传为本机`D:\workspace\codes\COLING\EGC\runs\qwen25_native_eos_smoke_results.zip`。包内含日志、训练清单、预测及完成/失败报告，不含权重；失败也会尝试打包，若无ZIP则回传终端报错。检查只要求12/12完整JSON并正常停止，不评刑期MAE；通过后再决定新目录下三组完整训练，失败则先审日志，短训失败不能证明充分训练无效。无需重复数据清洗或先前两种探针。
+
+142项离线测试通过；真实GPU小试尚未运行。小试通过也不能称全dev已修复或方法优于原论文。
+
 **2026-09-26：本轮已经完成，暂停重新执行下方全量训练命令。** 三组LoRA均完成894步，但答案结束后续写导致有效率为0；先按[结果与诊断命令](QWEN25_DEV_RESULT.md)执行只读CPU检查，保留现有adapter和结果。H4暂不可比较，正式test仍冻结。
 
 **2026-09-24更新：** 用户先完成旧命令的Qwen3-1.7B全参实验，隔离包已实际生成并核验4757/528；[结果](QWEN17_DEV_RESULT.md)显示flat先导信号、bound无增益证据。下方Qwen2.5命令作为下一轮同数据复核，直接复用服务器已有包，不再运行本机隔离。使用不同run目录，勿覆盖1.7B结果。

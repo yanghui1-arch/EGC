@@ -10,7 +10,7 @@ from pathlib import Path
 from .io import digest, index_unique, read_json, read_rows, write_json, write_rows
 
 MODEL_ROOT = "/mnt/yanghui/models/Qwen"
-SFT_TOKENIZATION_VERSION = "explicit-no-thinking-qwen2-chatml-v2"
+SFT_TOKENIZATION_VERSION = "explicit-no-thinking-qwen2-native-eos-v3"
 QWEN2_CHAT_TEMPLATE = (
     "{% for message in messages %}"
     "{{ '<|im_start|>' + message['role'] + '\\n' + message['content'] + '<|im_end|>\\n' }}"
@@ -26,6 +26,7 @@ def configure_chat(tokenizer, model_config):
     """
     source = "checkpoint"
     stop_ids = []
+    completion_end = None
     if model_config.get("model_type") == "qwen2":
         for token, expected in (("<|im_start|>", 151644), ("<|im_end|>", 151645)):
             if tokenizer.encode(token, add_special_tokens=False) != [expected]:
@@ -36,10 +37,14 @@ def configure_chat(tokenizer, model_config):
         # Qwen2.5 Base can use endoftext as EOS while chat sequences end at im_end.
         # Include im_end explicitly in inference, alongside the model's own EOS.
         stop_ids = [151645]
+        if model_config.get("eos_token_id") == 151643:
+            if tokenizer.eos_token_id != 151643 or tokenizer.encode("<|endoftext|>", add_special_tokens=False) != [151643]:
+                raise ValueError("Qwen2 Base native EOS does not match the tokenizer")
+            completion_end = "<|endoftext|>"
     if not tokenizer.chat_template:
         raise ValueError("Checkpoint has no chat template and no supported Qwen2 serialization")
     return {"source": source, "template_hash": digest(tokenizer.chat_template),
-            "stop_token_ids": stop_ids}
+            "stop_token_ids": stop_ids, "completion_end_token": completion_end}
 
 
 def select_training_mode(parameter_count, requested="auto"):
@@ -91,11 +96,18 @@ def render_chat(tokenizer, messages):
     return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True, enable_thinking=False)
 
 
-def tokenize_sft_row(tokenizer, row):
+def tokenize_sft_row(tokenizer, row, chat_protocol):
     """Render on the server before TRL; preserve the exact inference prefix and loss mask."""
     prompt = render_chat(tokenizer, row["prompt"])
     conversation = tokenizer.apply_chat_template(row["prompt"] + row["completion"],
                       tokenize=False, add_generation_prompt=False, enable_thinking=False)
+    if chat_protocol.get("completion_end_token"):
+        # Change only the supervised final terminator, preserving the inference prefix.
+        end = "<|im_end|>"
+        conversation = conversation.rstrip()
+        if not conversation.endswith(end) or row["completion"][-1]["role"] != "assistant":
+            raise ValueError("Qwen2 Base completion must end with an assistant ChatML turn")
+        conversation = conversation[:-len(end)] + chat_protocol["completion_end_token"]
     if not conversation.startswith(prompt):
         raise ValueError(f"Training template does not preserve the inference prefix: {row['id']}")
     prompt_ids = tokenizer.encode(prompt, add_special_tokens=False)
@@ -166,7 +178,7 @@ def train(args):
     # Fail instead of silently dropping the final month label during truncation.
     too_long, tokenized = [], {}
     for row in train_rows + dev_rows:
-        sample = tokenize_sft_row(tokenizer, row)
+        sample = tokenize_sft_row(tokenizer, row, chat_protocol)
         tokenized[row["id"]] = sample
         if len(sample["input_ids"]) > args.max_length:
             too_long.append({"id": row["id"], "tokens": len(sample["input_ids"])})
@@ -219,6 +231,12 @@ def train(args):
         return Dataset.from_list([tokenized[r["id"]] for r in rows])
     trainer = SFTTrainer(model=model, args=config, processing_class=tokenizer,
                          train_dataset=dataset(train_rows), eval_dataset=dataset(dev_rows), **trainer_options)
+    if chat_protocol.get("completion_end_token"):
+        # EOS may also be PAD: verify the real TRL collator keeps its loss target.
+        sample = trainer.train_dataset[0]
+        batch = trainer.data_collator([sample])
+        if batch["labels"][0][len(sample["input_ids"]) - 1].item() != tokenizer.eos_token_id:
+            raise ValueError("TRL masked or changed the supervised native EOS target")
     trainable_parameters = trainer.model.num_parameters(only_trainable=True)
     if training_mode == "full" and trainable_parameters != total_parameters:
         raise ValueError("Full SFT unexpectedly contains frozen parameters")

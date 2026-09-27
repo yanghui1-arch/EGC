@@ -29,7 +29,7 @@ class TrainingTests(unittest.TestCase):
     def test_explicit_rendering_and_completion_mask(self):
         tokenizer = tokenizer_fixture()
         _, rows, _ = prepare([row()], "base")
-        result = tokenize_sft_row(tokenizer, rows[0])
+        result = tokenize_sft_row(tokenizer, rows[0], {})
         prompt = tokenizer.apply_chat_template.call_args_list[0]
         self.assertFalse(prompt.kwargs["enable_thinking"])
         self.assertTrue(prompt.kwargs["add_generation_prompt"])
@@ -48,15 +48,15 @@ class TrainingTests(unittest.TestCase):
         tokenizer = tokenizer_fixture()
         tokenizer.apply_chat_template.side_effect = ["prefix", "different-prefix-answer"]
         with self.assertRaisesRegex(ValueError, "inference prefix"):
-            tokenize_sft_row(tokenizer, rows[0])
+            tokenize_sft_row(tokenizer, rows[0], {})
         tokenizer = tokenizer_fixture()
         tokenizer.encode.side_effect = [[1, 2], [1, 3, 4]]
         with self.assertRaisesRegex(ValueError, "token boundary"):
-            tokenize_sft_row(tokenizer, rows[0])
+            tokenize_sft_row(tokenizer, rows[0], {})
         tokenizer = tokenizer_fixture()
         tokenizer.encode.side_effect = [[1, 2], [1, 2]]
         with self.assertRaisesRegex(ValueError, "token boundary"):
-            tokenize_sft_row(tokenizer, rows[0])
+            tokenize_sft_row(tokenizer, rows[0], {})
 
     def test_parameter_boundary_and_explicit_policy(self):
         for count, mode in ((1_700_000_000, "full"), (4_000_000_000, "full"),
