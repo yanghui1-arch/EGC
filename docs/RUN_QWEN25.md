@@ -1,6 +1,26 @@
 # 首轮改用Qwen2.5-7B
 
-**2026-09-27当前执行：先运行原生EOS修复小试，下方旧全量命令仅作历史记录。** 两例Transformers探针也达到2048上限，详见[诊断结果](QWEN25_DEV_RESULT.md)。下面只从Qwen2.5-7B基座新训direct 32步、生成12个固定dev案例，不使用旧adapter继续训练，不调用API：
+**2026-09-27当前执行：原生EOS小试12/12通过，开始完整dev复核。** 数据包和预测身份已核验，详见[验收结果](QWEN25_DEV_RESULT.md)。运行下面命令，从同一基座分别新训direct/flat/bound各3epochs，并生成frozen及三组全部528 dev结果；保留旧实验和小试目录。
+
+```bash
+cd /mnt/yanghui/EGC
+git pull --ff-only
+CUDA_VISIBLE_DEVICES=0 python -m egc.learned_server run \
+  --model /mnt/yanghui/models/Qwen/Qwen2.5-7B \
+  --archive data/learned_v2_screened/experiment.zip \
+  --output runs/learned_v2_screened_qwen25_7b_native_eos_seed42 \
+  --seed 42 \
+  --epochs 3 \
+  --max-length 8192
+```
+
+沿用原包4757 train/528 dev，无需本机清洗或API。实际>=7B继续LoRA，rank64/alpha128/dropout0.05、lr1e-5、batch1×累积16、最终epoch导出；三组统一使用v3原生EOS监督。新目录不加resume，不使用32步adapter作为起点；小试的max_steps=32不会进入这条命令。预计各894个优化步，以实际完成记录为准。脚本只评dev，不运行正式test。
+
+完成后将服务器`/mnt/yanghui/EGC/runs/learned_v2_screened_qwen25_7b_native_eos_seed42/results.zip`私传为本机`D:\workspace\codes\COLING\EGC\runs\results_qwen25_7b_native_eos_seed42.zip`。若失败，保留新目录并回传failure.json、日志和可用结果包，先核查再决定续跑，不覆盖旧结果。验收先看覆盖率/预测分布/预算，再看bound对flat的配对误差；12例小试通过不等于完整实验或研究创新已成功。
+
+以下命令保留为历史记录，不需再次运行小试或旧目录训练。
+
+**2026-09-27先前步骤：原生EOS修复小试。** 两例Transformers探针也达到2048上限，详见[诊断结果](QWEN25_DEV_RESULT.md)。下面只从Qwen2.5-7B基座新训direct 32步、生成12个固定dev案例，不使用旧adapter继续训练，不调用API：
 
 ```bash
 cd /mnt/yanghui/EGC

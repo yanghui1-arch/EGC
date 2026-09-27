@@ -1,5 +1,7 @@
 # EGC科研主记录：创新点、实验计划与进度
 
+**2026-09-27 原生EOS小试验收（当前执行优先）：** 用户回传`runs/qwen25_native_eos_smoke_seed42_results.zip`，SHA256 `f5e47fe95918ccd7800706a6d326d5c3ad888b0f0dc40d35886e5e2e4ae10c9b`。9个证据成员校验和、原数据包4757/528、训练输入hash、固定每罪名首条12个ID及预测指纹均核验通过；服务器提交707eec4，新direct LoRA确实完成32步、v3原生EOS监督，两个子进程均正常结束。重算12/12完整JSON且finish_reason=stop，输出58–192 token、中位92，满足预设终止门槛；未计算MAE或验证理由语义，8条预测12月/4条120月的集中现象仍须检查。本次只验证短训direct，不能宣称三组完整dev已修复或H4成立。下一步用户按[完整复核命令](RUN_QWEN25.md)在新目录`runs/learned_v2_screened_qwen25_7b_native_eos_seed42`从基座分别训练direct/flat/bound，各3epochs/seed42，并重跑同协议frozen和全部528 dev。复用原包与超参，不续跑旧adapter或小试、不重新清洗/标注、不运行正式test。完整结果回传后先检查覆盖率、终止、预测分布及预算，再比较配对MAE/区间和bound对flat的3%门槛；H4及创新点不变。本轮仅只读验收和文档更新，沿用142项离线软件测试，未重复运行或新增模型效果指标。
+
 **2026-09-27 GPU探针验收与当前下一步（覆盖下方历史状态）：** `runs/qwen25_generation_probe.json`与原direct前两条任务、原vLLM预测及模型配置一致，SHA256为`e529d158a78abeaabee077c3857e88747ec42997e03a594b875f19702c7e4a90`。Transformers+PEFT两条也均续写至2048，原JSON边界im_end排名131/149，原生EOS排名12676/13024。换引擎未解决这两例，支持模型侧结束标记学习失败；不证明所有根因或全dev行为。已实现Qwen2 Base的原生EOS终止监督：保持输入模板、答案正文与LoRA预算，只将最终assistant的im_end及尾随换行替换成endoftext，并检查实际TRL collator保留EOS监督。新分词协议v3禁止混用旧续跑身份。新增`egc.qwen_eos_smoke`：用户服务器从基座新训direct 32步，再对固定每罪名首条共12个dev输入生成，不计算MAE、不使用测试集、不自动启动完整训练。142项离线测试通过，真实修复效果未验证。下一步按[新命令](RUN_QWEN25.md)运行并回传`runs/qwen25_native_eos_smoke_results.zip`；12/12完整JSON且正常停止才进入全量复核，失败则检查证据，32步失败不等于充分训练仍无法学会。H4仍未获支持，创新点不变，历史失败评分保留。
 
 **2026-09-27 CPU诊断已验收（当前下一步）：** 用户回传qwen25_stop_diagnostic.json，三个adapter词表/模板与基座一致；两个已观察异常字符的lm_head行均不等于im_end行，故“完全重合”猜测未获支持。im_start/im_end部分向量差异很小，但未实测logit，根因仍未确定，详见[报告新增诊断节](QWEN25_DEV_RESULT.md)。已实现`egc.diagnose_qwen_stop --generate`：服务器复用direct adapter、固定前两条原dev输入做Transformers生成及原答案边界logit检查，写入`runs/qwen25_generation_probe.json`。用户下一步仅执行该GPU探针，不重训、不重复CPU检查、不改原评分。14项相关离线检查通过，真实探针尚待回传；本轮无新模型效果，H4结论不变。
@@ -285,5 +287,7 @@ B0冻结协议`configs/b0_protocol.json`绑定v6 dev哈希及112行总体，从�
 | 2026-09-27，CPU诊断实测验收与跨引擎探针 | 三个adapter词表/模板一致；两个异常字输出行与im_end不完全相等，实测否定该有限集合的完全重合猜测，尚无生成logit证据 | 保留未定根因，不凭近似值改模型或追分；实现两例Transformers+PEFT复用adapter诊断，与原vLLM输出对照。14项离线检查通过，用户下一步GPU探针；不重训、不调用API、不改历史结果，H4仍未支持 |
 
 | 2026-09-27，GPU探针实测与原生EOS小试交付 | 原direct前两例在Transformers也2048截断，im_end边界排名131/149；换引擎不能修复这两例 | 修正Base终止监督而非截取答案补分；实现新direct 32步/固定12例小试，复用原数据与其余超参，142项离线测试通过。实际小试待用户服务器执行；通过仅放行新协议全量验证，不能称H4增益，失败不直接证明方法无效。没有助手API/训练/推理任务 |
+
+| 2026-09-27，原生EOS小试通过与全量dev放行 | 707eec4服务器direct LoRA 32步，数据/训练/预测身份及9成员校验通过，12/12完整JSON且正常停止，58–192 token；没有MAE或语义验证 | 达到预设小试门槛，交付新目录同包3组3epochs/seed42及frozen/528 dev命令；不续跑小试、不开放test。预测仍集中12/120月，完整结果须检查分布与绑定优势；H4未获新支持。此次仅文档更新及只读证据核验，无助手训练/API任务 |
 
 后续记录应写清操作/实验ID、输入及配置版本、实际结果、对H1/H2/H3/H4的影响、下一步和未解决问题。方向变化必须有依据，保留失败结果，不能将计划写成已完成。
