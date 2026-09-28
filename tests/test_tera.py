@@ -68,6 +68,43 @@ class DataTests(unittest.TestCase):
 
 
 class OrchestrationTests(unittest.TestCase):
+    def test_readonly_diagnostic_inventory_fixed_inputs_and_no_training(self):
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+        from egc.tera_server import diagnose_cache, file_hash
+        from egc.tera_data import VERSION
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp).resolve()
+            execution = {"version": VERSION, "model": str(root / "base"), "seed": 42, "epochs": 3, "max_length": 8192}
+            write_json(root / "execution.json", execution)
+            jobs = [{"id": str(i), "split": "dev", "messages": [{"role": "user", "content": "synthetic"}],
+                     "prompt_hash": digest([{"role": "user", "content": "synthetic"}])} for i in range(5)]
+            write_rows(root / "data/direct.dev.jobs.jsonl", jobs)
+            write_json(root / "token_budget.json", {"dev_jobs_hash": digest(jobs), "training_hash": "synthetic", "chat_protocol": {}})
+            artifact = root / "direct/artifact"
+            write_json(artifact / "module.json", execution | {"arm": "direct", "training_hash": "synthetic", "chat_protocol": {}, "max_steps": -1})
+            write_json(root / "direct/completion.json", {"artifact": str(artifact), "complete": True,
+                "global_step": 894, "training_mode": "lora", "artifact_sha256": {"module.json": file_hash(artifact / "module.json")}})
+            before = file_hash(artifact / "module.json")
+            with patch.dict("sys.modules", {"torch": SimpleNamespace(cuda=SimpleNamespace(empty_cache=lambda: None),
+                                             backends=SimpleNamespace(cuda=SimpleNamespace(matmul=SimpleNamespace(allow_tf32=True)))),
+                                             "transformers": SimpleNamespace(set_seed=lambda seed: None)}), \
+                 patch("egc.tera_server.require_server"), patch("egc.tera_server.tokenizer_for", return_value=(None, {})), \
+                 patch("egc.tera_server.prompt_features", return_value=([1, 2], {}, [])), \
+                 patch("egc.tera_server.load_model", return_value=(Mock(), 1, "lora")) as load, \
+                 patch("egc.tera_server.cache_probe", return_value={"passed": False}) as probe, \
+                 patch("egc.tera_server.collect", return_value="synthetic.zip"), patch("egc.tera_server.train") as train:
+                report = diagnose_cache(root)
+            self.assertEqual(report["selected_ids"], ["0", "1", "2"])
+            self.assertEqual(probe.call_count, 4)
+            self.assertEqual(probe.call_args.kwargs["precision"], "fp32")
+            load.assert_called_once()
+            train.assert_not_called()
+            self.assertEqual(report["models"]["direct"]["status"], "diagnosed")
+            self.assertEqual(report["models"]["tera_noaux"]["status"], "no_exported_checkpoint_to_probe")
+            self.assertFalse(report["training_performed"])
+            self.assertEqual(file_hash(artifact / "module.json"), before)
+
     def test_gate_fresh_full_runs_and_failure_collection(self):
         from egc.tera_server import ARMS, run
         with tempfile.TemporaryDirectory() as temp:
@@ -157,6 +194,51 @@ class ModelTests(unittest.TestCase):
             model.adapter.memory(h, bad)
         with self.assertRaises(ValueError):
             model.step(self.ids.expand(2, -1), meta=self.meta)
+
+    def test_cache_probe_reports_backbone_and_keeps_failed_gate(self):
+        from egc.tera_server import cache_probe
+        model = self.model.eval()
+        report = cache_probe(model, self.ids[0, :8].tolist(), self.meta, steps=4)
+        self.assertTrue(report["passed"])
+        self.assertEqual(len(report["steps"]), 4)
+        self.assertLess(report["steps"][0]["module_increment_difference_max_abs"], 1e-6)
+        original = model.step
+        def drift(*args, **kwargs):
+            result = original(*args, **kwargs)
+            if kwargs.get("return_base_logits"):
+                logits, memory, past, baseline = result
+                # Uniform shift preserves greedy tokens but must still fail the old .25 gate.
+                return logits + 0.3125, memory, past, baseline
+            return result
+        with patch.object(model, "step", side_effect=drift):
+            report = cache_probe(model, self.ids[0, :8].tolist(), self.meta)
+        self.assertFalse(report["passed"])
+        self.assertTrue(report["argmax_equal"])
+        self.assertGreater(report["steps"][0]["module_increment_difference_max_abs"], 0.3)
+        self.assertLess(report["steps"][0]["backbone_max_abs"], 1e-5)
+
+    def test_post_training_failure_preserves_weights_and_incomplete_status(self):
+        from types import SimpleNamespace
+        from egc.tera_server import finish_training, file_hash
+        tokenizer = SimpleNamespace(save_pretrained=lambda path: write_json(Path(path) / "synthetic.json", {}))
+        for fail in ("threshold", "exception"):
+            with tempfile.TemporaryDirectory() as temp:
+                out = Path(temp)
+                def probe(*args):
+                    saved = read_json(out / "completion.json")
+                    self.assertTrue(saved["training_complete"])
+                    self.assertFalse(saved["complete"])
+                    self.assertTrue((out / "artifact/memory.pt").is_file())
+                    if fail == "exception":
+                        raise RuntimeError("synthetic diagnostic failure")
+                    return {"passed": False, "cached_vs_full_max_abs": 0.3125}
+                with patch("egc.tera_server.cache_probe", side_effect=probe), self.assertRaises((ValueError, RuntimeError)):
+                    finish_training(self.model, tokenizer, out, {"arm": "tera"}, {"global_step": 894}, [], {})
+                done = read_json(out / "completion.json")
+                self.assertFalse(done["complete"])
+                self.assertEqual(done["validation_status"], "failed")
+                self.assertEqual(done["global_step"], 894)
+                self.assertTrue(all(file_hash(out / "artifact" / name) == expected for name, expected in done["artifact_sha256"].items()))
 
     def test_generic_does_not_route_by_aux_labels_and_parameter_budget(self):
         from egc.tera_model import EvidenceAdapter

@@ -114,11 +114,12 @@ class MemoryCausalLM(nn.Module):
         self.last_losses = {"sft": float(sft.detach()), "role": float(auxiliary.detach())}
         return {"loss": loss}
 
-    def step(self, input_ids, meta=None, memory=None, past=None):
+    def step(self, input_ids, meta=None, memory=None, past=None, return_base_logits=False):
         if input_ids.shape[0] != 1:
             raise ValueError("TERA v1 decodes one independent request at a time")
         output = self.base.model(input_ids=input_ids, past_key_values=past, use_cache=True, return_dict=True)
         hidden = output.last_hidden_state[0]
+        base_logits = self.base.lm_head(hidden[-1:])[0].float() if return_base_logits else None
         if self.adapter is not None:
             if past is None:
                 if meta is None or meta["prompt_length"] != len(hidden) or memory is not None:
@@ -130,4 +131,5 @@ class MemoryCausalLM(nn.Module):
         logits = self.base.lm_head(hidden[-1:])[0].float()
         if not torch.isfinite(logits).all():
             raise ValueError("Non-finite generation logits")
-        return logits, memory, output.past_key_values
+        result = (logits, memory, output.past_key_values)
+        return result + (base_logits,) if return_base_logits else result

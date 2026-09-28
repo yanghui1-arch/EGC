@@ -108,31 +108,85 @@ def collate(rows):
             "meta": row["meta"], "role_labels": row["role_labels"]}
 
 
-def cache_probe(model, ids, meta):
-    """Real-checkpoint check: cached vs recomputed second-step logits; no gold input."""
+def cache_probe(model, ids, meta, steps=1, precision="bf16"):
+    """Compare identical weights/tokens with and without cache; keep the 0.25 gate."""
+    from contextlib import nullcontext
     import torch
+    if not 1 <= steps <= 4:
+        raise ValueError("Cache diagnostic is bounded to 1-4 continuation steps")
+    if precision not in ("bf16", "fp32"):
+        raise ValueError("Unknown diagnostic precision")
     model.eval()
-    tokens = torch.tensor([ids], device="cuda")
-    with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
+    device = next(model.parameters()).device
+    tokens = torch.tensor([ids], device=device)
+    autocast = torch.autocast("cuda", dtype=torch.bfloat16) if device.type == "cuda" and precision == "bf16" else nullcontext()
+    checks = []
+    with torch.inference_mode(), autocast:
         first, memory, past = model.step(tokens, meta=meta)
         next_id = first.argmax().reshape(1, 1)
-        cached, _, _ = model.step(next_id, memory=memory, past=past)
-        full = model.base.model(input_ids=torch.cat((tokens, next_id), 1), use_cache=False, return_dict=True).last_hidden_state[0]
-        tail = full[-1:]
-        memory_error = 0.0
-        if model.adapter is not None:
-            fresh_memory = model.adapter.memory(full, meta)
-            memory_error = max(float((fresh_memory[k].float() - memory[k].float()).abs().max()) for k in memory)
-            tail = model.adapter(tail, fresh_memory)
-        recomputed = model.base.lm_head(tail)[0].float()
-        error = float((cached - recomputed).abs().max())
-        if not torch.isfinite(recomputed).all() or error > 0.25 or memory_error > 0.25 or cached.argmax() != recomputed.argmax():
-            raise ValueError(f"Cached decode check failed: logits={error}, memory={memory_error}")
+        for position in range(steps):
+            cached, _, past, base_cached = model.step(next_id, memory=memory, past=past, return_base_logits=True)
+            tokens = torch.cat((tokens, next_id), 1)
+            full = model.base.model(input_ids=tokens, use_cache=False, return_dict=True).last_hidden_state[0]
+            tail = full[-1:]
+            base_full = model.base.lm_head(tail)[0].float()
+            memory_error = 0.0
+            if model.adapter is not None:
+                fresh_memory = model.adapter.memory(full, meta)
+                memory_error = max(float((fresh_memory[k].float() - memory[k].float()).abs().max()) for k in memory)
+                tail = model.adapter(tail, fresh_memory)
+            recomputed = model.base.lm_head(tail)[0].float()
+            if not all(torch.isfinite(x).all() for x in (cached, recomputed, base_cached, base_full)):
+                raise ValueError("Non-finite cache diagnostic logits")
+            difference = cached - recomputed
+            worst = int(difference.abs().argmax())
+            error = float(difference.abs().max())
+            equal = bool(cached.argmax() == recomputed.argmax())
+            def top_summary(logits):
+                top = logits.topk(2)
+                return {"token": int(top.indices[0]), "margin": float(top.values[0]-top.values[1])}
+            checks.append({"position": position + 1, "cached_vs_full_max_abs": error,
+                "cached_vs_full_rms": float(difference.square().mean().sqrt()), "memory_max_abs": memory_error,
+                "argmax_equal": equal, "cached_greedy": top_summary(cached), "full_greedy": top_summary(recomputed),
+                "worst_token": worst, "worst_cached_logit": float(cached[worst]), "worst_full_logit": float(recomputed[worst]),
+                "backbone_max_abs": float((base_cached-base_full).abs().max()),
+                "backbone_argmax_equal": bool(base_cached.argmax() == base_full.argmax()),
+                "module_increment_difference_max_abs": float((difference-(base_cached-base_full)).abs().max()),
+                "passed": error <= 0.25 and memory_error <= 0.25 and equal})
+            next_id = cached.argmax().reshape(1, 1)
         top = first.topk(8)
-        return {"cached_vs_full_max_abs": error, "memory_max_abs": memory_error,
-                "argmax_equal": True, "first_token": int(first.argmax()),
+        return {"version": "cache-diagnostic-v2", "precision": precision if device.type == "cuda" else "cpu_float32",
+                "passed": all(c["passed"] for c in checks),
+                "cached_vs_full_max_abs": max(c["cached_vs_full_max_abs"] for c in checks),
+                "memory_max_abs": max(c["memory_max_abs"] for c in checks),
+                "argmax_equal": all(c["argmax_equal"] for c in checks), "first_token": int(first.argmax()),
                 "first_top_ids": top.indices.tolist(), "first_top_logits": top.values.tolist(),
-                "note": "bf16 tolerance 0.25 and equal greedy token; two-step single-request check"}
+                "steps": checks, "note": "Unchanged absolute tolerance 0.25 and equal greedy token; backbone includes its trained LoRA"}
+
+
+def finish_training(network, tokenizer, out, manifest, completion, ids, meta):
+    """Export before post-training validation can discard an expensive run."""
+    import torch
+    artifact = out / "artifact"
+    network.backbone.save_pretrained(artifact / "backbone", safe_serialization=True)
+    tokenizer.save_pretrained(artifact / "tokenizer")
+    if network.adapter is not None:
+        torch.save(network.adapter.state_dict(), artifact / "memory.pt")
+    write_json(artifact / "module.json", manifest)
+    checksums = {p.relative_to(artifact).as_posix(): file_hash(p) for p in artifact.rglob("*") if p.is_file()}
+    done = completion | {"complete": False, "training_complete": True, "validation_status": "pending",
+                        "artifact": str(artifact), "artifact_sha256": checksums}
+    write_json(out / "completion.json", done)
+    try:
+        done["cache_probe"] = cache_probe(network, ids, meta)
+        if not done["cache_probe"]["passed"]:
+            raise ValueError("Cached decode check failed; trained weights preserved; inspect completion.json cache_probe")
+        done.update(complete=True, validation_status="passed")
+    except Exception as exc:
+        done.update(validation_status="failed", validation_error={"type": type(exc).__name__, "message": str(exc)})
+        raise
+    finally:
+        write_json(out / "completion.json", done)
 
 
 def train(data, output, model, arm, seed, epochs, max_steps, max_length):
@@ -209,19 +263,11 @@ def train(data, output, model, arm, seed, epochs, max_steps, max_length):
         raise ValueError("Module residual remained zero after training")
     probe_job = read_rows(data / "direct.dev.jobs.jsonl")[0]
     ids, meta, _ = prompt_features(tokenizer, probe_job["messages"])
-    probe = cache_probe(network, ids, meta)
-    artifact = out / "artifact"
-    network.backbone.save_pretrained(artifact / "backbone", safe_serialization=True)
-    tokenizer.save_pretrained(artifact / "tokenizer")
-    if network.adapter is not None:
-        torch.save(network.adapter.state_dict(), artifact / "memory.pt")
-    write_json(artifact / "module.json", manifest)
-    checksums = {p.relative_to(artifact).as_posix(): file_hash(p) for p in artifact.rglob("*") if p.is_file()}
-    write_json(out / "completion.json", {"complete": True, "artifact": str(artifact), "arm": arm,
+    finish_training(network, tokenizer, out, manifest, {"arm": arm,
         "training_mode": mode, "global_step": trainer.state.global_step, "train_metrics": result.metrics,
         "module_up_max_abs": module_update,
-        "gradient_checks": gradient_checks, "cache_probe": probe, "artifact_sha256": checksums,
-        "seconds": time.time() - started, "peak_memory_gib": torch.cuda.max_memory_allocated() / 1024**3})
+        "gradient_checks": gradient_checks,
+        "seconds": time.time() - started, "peak_memory_gib": torch.cuda.max_memory_allocated() / 1024**3}, ids, meta)
 
 
 def infer(data, trained, output, model, seed, max_length, smoke=False):
@@ -253,6 +299,9 @@ def infer(data, trained, output, model, seed, max_length, smoke=False):
     network.eval()
     ids, meta, _ = prompt_features(tokenizer, jobs[0]["messages"])
     probe = cache_probe(network, ids, meta)
+    if not probe["passed"]:
+        write_json(output.with_suffix(".cache.metrics.json"), probe)
+        raise ValueError("Cached decode check failed; inspect saved cache.metrics.json; weights are unchanged")
     original = done["cache_probe"]
     if probe["first_top_ids"] != original["first_top_ids"] or max(abs(a-b) for a, b in zip(probe["first_top_logits"], original["first_top_logits"])) > 0.01:
         raise ValueError("Save/reload logits changed")
@@ -326,6 +375,89 @@ def evaluate(data, root):
         "limitations": "Single seed; weak-label semantics unverified; no original-paper reproduction; no test evaluation"})
 
 
+def diagnose_cache(run_dir):
+    """No training: inspect saved artifacts and three fixed dev prompts per model."""
+    require_server()
+    import gc
+    import torch
+    from transformers import set_seed
+    root = Path(run_dir).resolve()
+    execution = read_json(root / "execution.json")
+    if execution["version"] != VERSION:
+        raise ValueError("Wrong experiment version")
+    budget = read_json(root / "token_budget.json")
+    jobs = read_rows(root / "data/direct.dev.jobs.jsonl")
+    if digest(jobs) != budget["dev_jobs_hash"] or any(j["prompt_hash"] != digest(j["messages"]) or j["split"] != "dev" for j in jobs):
+        raise ValueError("Changed dev prompts; refusing diagnosis")
+    tokenizer, protocol = tokenizer_for(execution["model"])
+    if protocol != budget["chat_protocol"]:
+        raise ValueError("Changed tokenizer protocol")
+    selected = jobs[:3]  # fixed input order, no gold/reference-based selection
+    path = root / f"cache_diagnostic_{time.time_ns()}.metrics.json"
+    report = {"kind": "cache_diagnostic_only", "run_dir": str(root), "version": VERSION,
+        "execution_hash": digest(execution), "training_hash": budget["training_hash"],
+        "selected_ids": [j["id"] for j in selected], "continuation_steps": 4, "fp32_control_ids": [selected[0]["id"]],
+        "training_performed": False, "benchmark_scores_computed": False, "models": {},
+        "limitations": "Other saved arms cannot establish the cause in an unsaved failed arm; the 0.25 gate remains unchanged"}
+    write_json(path, report)
+    for name in ("smoke",) + ARMS:
+        trained = root / name
+        entry = {"artifact_exists": (trained / "artifact").is_dir(),
+                 "completion_exists": (trained / "completion.json").is_file()}
+        report["models"][name] = entry
+        network = None
+        try:
+            if not entry["artifact_exists"] or not entry["completion_exists"]:
+                entry["status"] = "no_exported_checkpoint_to_probe"
+                continue
+            done = read_json(trained / "completion.json")
+            artifact = trained / "artifact"
+            if Path(done["artifact"]).resolve() != artifact.resolve() or not (done.get("complete") or done.get("training_complete")):
+                raise ValueError("Unconfirmed/foreign training artifact")
+            checksums = {p.relative_to(artifact).as_posix(): file_hash(p) for p in artifact.rglob("*") if p.is_file()}
+            if checksums != done["artifact_sha256"]:
+                raise ValueError("Artifact checksum mismatch")
+            manifest = read_json(artifact / "module.json")
+            arm = "tera" if name == "smoke" else name
+            expected = {"version": VERSION, "arm": arm, "model": execution["model"],
+                "training_hash": budget["training_hash"], "chat_protocol": protocol,
+                "seed": execution["seed"], "epochs": execution["epochs"], "max_length": execution["max_length"],
+                "max_steps": 32 if name == "smoke" else -1}
+            if any(manifest.get(k) != v for k, v in expected.items()):
+                raise ValueError("Checkpoint experiment identity mismatch")
+            entry.update(artifact_hash=digest(checksums), global_step=done["global_step"], probes=[])
+            set_seed(execution["seed"])
+            load_path = str(artifact / "backbone") if done["training_mode"] == "full" else execution["model"]
+            network, _, _ = load_model(load_path, arm, artifact)
+            for job in selected:
+                ids, meta, _ = prompt_features(tokenizer, job["messages"])
+                entry["probes"].append({"id": job["id"], "prompt_hash": job["prompt_hash"],
+                                        "diagnostic": cache_probe(network, ids, meta, steps=4)})
+            # Same saved weights/input, higher precision control; never save converted weights.
+            previous_tf32 = torch.backends.cuda.matmul.allow_tf32
+            try:
+                torch.backends.cuda.matmul.allow_tf32 = False
+                network.float()
+                ids, meta, _ = prompt_features(tokenizer, selected[0]["messages"])
+                entry["fp32_control"] = cache_probe(network, ids, meta, steps=4, precision="fp32")
+            except Exception as exc:
+                entry["fp32_control_error"] = {"type": type(exc).__name__, "message": str(exc)}
+            finally:
+                torch.backends.cuda.matmul.allow_tf32 = previous_tf32
+            entry["status"] = "diagnosed"
+        except Exception as exc:
+            entry.update(status="error", error_type=type(exc).__name__, message=str(exc))
+        finally:
+            del network
+            gc.collect()
+            torch.cuda.empty_cache()
+            write_json(path, report)
+            print(name + ": " + entry["status"], flush=True)
+    print("Return cache diagnostic:", path, flush=True)
+    print("Return experiment evidence:", collect(root), flush=True)
+    return report
+
+
 def run(archive, output, model=DEFAULT_MODEL, seed=42, epochs=3, max_length=8192, smoke_only=False):
     require_server()
     if epochs <= 0 or max_length <= 2048:
@@ -380,6 +512,8 @@ def run(archive, output, model=DEFAULT_MODEL, seed=42, epochs=3, max_length=8192
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
+    diagnostic = commands.add_parser("diagnose-cache")
+    diagnostic.add_argument("--run-dir", required=True)
     for name in ("run", "train", "infer"):
         sub = commands.add_parser(name)
         sub.add_argument("--model", default=DEFAULT_MODEL)
@@ -401,7 +535,7 @@ def main():
             sub.add_argument("--smoke", action="store_true")
     args = vars(parser.parse_args())
     command = args.pop("command")
-    {"run": run, "train": train, "infer": infer}[command](**args)
+    {"run": run, "train": train, "infer": infer, "diagnose-cache": diagnose_cache}[command](**args)
 
 
 if __name__ == "__main__":

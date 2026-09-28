@@ -1,5 +1,22 @@
 # GPU 1：TERA模块先导实验
 
+**2026-09-28最新：暂不重跑整套训练，先诊断训练后缓存检查。** 用户日志显示`tera_noaux`的3epochs训练已返回，随后缓存检查报`logits=0.3125, memory=0.0`。旧门槛为最大绝对差0.25；日志没有argmax、主干误差或精度对照，不能确定是BF16数值差异还是缓存/模块错误。旧代码在该检查后才保存artifact，且save_strategy=no，因此失败组可能没有可恢复权重；先检查文件清单，不承诺恢复。此前的smoke/direct/generic按流程已走过，实际文件和结果仍需核验。
+
+现已将权重导出移动到缓存检查之前，completion.json分别记录training_complete与validation_status。缓存检查失败时保留artifact和校验和，但complete仍为false，不进入生成评分；此修复无法追溯恢复已经退出进程中的旧权重。检查报告新增相同权重/相同续接token下的主干logit差、模块增量差、argmax及margin、最大误差token和RMS。**没有放宽0.25门槛，也没有更改模型/训练/解码设置。**
+
+当前仅执行下面的只读GPU诊断，复用现有run目录：
+
+```bash
+cd /mnt/yanghui/EGC
+git pull --ff-only
+CUDA_VISIBLE_DEVICES=1 python -m egc.tera_server diagnose-cache \
+  --run-dir runs/tera_qwen25_7b_seed42_20260928_181851_23453
+```
+
+诊断先核验已保存artifact校验和、训练身份和dev prompt指纹，缺少导出权重的组明确标为no_exported_checkpoint_to_probe。对至多5个已有模型，各选固定前三条dev输入、各4个续接位置，比较缓存与整段重算；另对各模型第一条输入做同权重FP32对照（关闭TF32、仅在内存转精度，用后释放，不保存转换后的权重）。单个模型依次加载，FP32对照会增加显存；若失败则记录错误并保留已得诊断。没有训练、API、金标输入、指标评分或原预测改写。其他组的诊断不能直接证明未保存的tera_noaux权重为何失败。
+
+输出`原run目录/cache_diagnostic_<时间>.metrics.json`及新`results_<时间>.zip`，均不覆盖旧结果。请将终端最后提示的新ZIP放到本机EGC/runs并告知文件名。先用这份证据决定数值门槛/实现是否需要修改，再给出复用已完成组的恢复步骤；**当前没有新增自动续训命令**。11项TERA离线检查在Transformers5.17下通过，覆盖失败先保存、阈值不放宽、主干/模块分解与只读固定样本诊断；真实GPU诊断待用户运行。以下完整训练命令保留作原流程说明，当前不要用它整套重启。
+
 **2026-09-28启动错误已修复：** 首轮服务器在Trainer.train启用gradient checkpointing时因包装方法不接受every_n_layers而退出，尚无训练步。现原样转发包括every_n_layers/offload在内的kwargs到底层；无需降级Transformers或关闭checkpoint。8项相关合成检查已在Transformers5.17.0/PEFT0.20.0/Accelerate1.15.0及CPU Torch2.6通过，包括实际Trainer训练和四组透传回归；真实A100兼容性待重试。用户日志说明准备阶段已完成，不能把它当训练完成。保留runs/tera_qwen25_7b_seed42_20260928_180425_23415；拉取后执行下方原命令即可自动生成新目录。torch_dtype弃用警告不导致此次退出。接口依据[Transformers5.17官方签名](https://huggingface.co/docs/transformers/v5.17.0/en/main_classes/model#transformers.PreTrainedModel.gradient_checkpointing_enable)。
 
 2026-09-28：代码已实现，149项离线检查通过；没有真实TERA训练/benchmark结果。创新假设仍见[研究主记录](RESEARCH_PLAN.md)与[结构及文献](MODULE_RESEARCH_2025_2026.md)。本次只新增独立入口，未修改正在GPU 0运行的H4代码。

@@ -1,5 +1,7 @@
 # EGC科研主记录：创新点、实验计划与进度
 
+**2026-09-28 TERA训练后缓存检查失败（当前下一步）：** 用户附件日志定位到`runs/tera_qwen25_7b_seed42_20260928_181851_23453/logs/train_tera_noaux.log`，显示epoch3/训练耗时约3174秒后，在cache_probe出现logits最大差0.3125、memory差0，超出原0.25门槛。日志未给出argmax/主干/精度对照，原因未定，不能称BF16误报或模块失效；尚未收到这轮ZIP逐项验收。原顺序是检查后才保存，且无中途checkpoint，故失败组可能丢失未导出的权重，这是保存顺序缺陷。已改为缓存检查前保存artifact与hash，training_complete/validation_status分开，失败保持complete=false；补充主干、模块增量、greedy token/margin和RMS诊断，阈值不变。新增只读`egc.tera_server diagnose-cache --run-dir ...`复用保存组：固定前三个dev输入×4续接位置，第一例另做同权重FP32/禁用TF32对照，检查缺失artifact，不训练/API/评分/改写权重。11项相关CPU合成检查在Transformers5.17下通过；尚无真实GPU诊断和方法增益。下一步用户仅执行RUN_TERA.md顶部诊断命令并回传新results_<时间>.zip，暂不整套重训、不手动提高门槛。流程上smoke/direct/generic已走过，实际可复用产物待核验；若失败组没有checkpoint则无法恢复其内存权重，后续只重做必要组。自动恢复入口尚未新增；H5假设、四组对照和test冻结不变。
+
 **2026-09-28 TERA启动兼容修复（当前下一步）：** 用户确认专注新增模块有效性，并回传GPU 1小试启动失败日志。日志显示数据准备完成（target14453/other934/uncertain249；unlabelled16520、冲突110、跨块引用1670、重复引用13），这些是对齐计数，不是语义准确率；尚未收到该TERA结果ZIP逐项核验。Qwen2.5-7B基座及模块加载完成，新增可训练总数42,327,816；Trainer在首个训练步前向MemoryCausalLM.gradient_checkpointing_enable传入every_n_layers时抛TypeError，故没有TERA训练/效果结论。已修复共享包装方法，原样转发every_n_layers、offload等kwargs到底层，不禁用checkpoint、不丢弃参数或改训练超参。新增四组参数透传/未知参数拒绝回归，且在隔离安装的Transformers5.17.0、PEFT0.20.0、Accelerate1.15.0、Torch2.6 CPU上8项TERA合成检查通过（无skip），包括实际Trainer两步和PEFT梯度/保存重载；真实A100/Torch2.13仍待重试。下一步用户git pull后原命令CUDA_VISIBLE_DEVICES=1 bash scripts/server_tera.sh，新时间戳目录保留旧故障证据；无需重洗/调用API，不重跑H4。H5结构、对照与判定标准保持不变。
 
 **2026-09-28 原生EOS完整结果已验收：** 回传ZIP SHA256为f2ddc880997f408753f39f569b0e7cfca170d4e3231f54bd54495c4935b31f74，26成员校验、同4757/528数据、训练/预测身份及指标重算通过。bcb3077服务器三组各894步；direct/flat/bound均528/528完整JSON且正常停止，本轮终止故障解决。完整dev MAE分别15.4830/14.8087/14.7254月；bound对flat降低0.5627%，配对MAE差−0.0833月、95%区间[−0.7689,0.5568]，未达到原定3%继续投入门槛。点估计有改善信号，但未证明绑定独立有效；不把用户认可改善信号解释为统计证据已充分。各组96%以上刑期仍集中12/36/120月，dev金标对应35.23%，数值分布问题未解决。详细证据见[完整验收报告](QWEN25_NATIVE_EOS_RESULT.md)。H4作为已完成的监督对照保留，不再扩展；专注H5模块四组先导，正式test冻结。TERA须胜同后端generic等对照，不能用本轮分数直接替代其公平比较。
@@ -313,5 +315,7 @@ B0冻结协议`configs/b0_protocol.json`绑定v6 dev哈希及112行总体，从�
 | 2026-09-28，TERA代码与GPU 1自动先导交付 | 用户要求直接实现，新增3个Python模块、独立GPU 1脚本、7项合成测试；全库149项检查通过，TERA/generic实数参数差3.35%；无真实数据/API/GPU执行 | 复用同包、同direct监督，32步/12例及梯度/缓存/重载门槛后自动从基座做4组3epochs dev；新增同训练器direct避免归因混淆。用户回传results.zip后先验收再比较。60例语义审查、多seed、主体机制与原论文复现未完成；单请求首版拒绝batch>1，vLLM及中途续训未实现，正式test冻结，H5未获效果支持 |
 
 | 2026-09-28，native EOS完整结果与TERA启动修复 | 原生EOS三组894步、各528/528有效；bound−flat MAE为−0.0833月，区间跨零，0.56%未达3%门槛。用户转向模块；TERA准备成功但Trainer新参数在首步前触发TypeError | 已修复共享checkpoint参数转发；同Transformers5.17的8项CPU合成检查通过，实际GPU待用户原脚本新目录重试。对齐日志有other934/uncertain249但不代表标签准确；保留失败目录。H4归档为对照，不扩展；H5结构、预算及四组对照不改，尚无模块效果，test保持冻结 |
+
+| 2026-09-28，TERA无辅助损失组训练后检查中断 | 用户日志显示3epochs完成后cache_probe差0.3125>0.25、memory0；缺少greedy/主干精度对照，未取得结果ZIP。旧代码检查前不导出且无中途保存 | 修复缓存检查前保存，失败保留权重但不评分；新增只读已保存模型诊断及FP32对照，11项相关CPU检查通过。用户先返回新诊断ZIP，再确定数值原因和可复用组；不调高门槛、不整套重训、不声称恢复旧未保存权重。模块有效性未验证，test仍冻结 |
 
 后续记录应写清操作/实验ID、输入及配置版本、实际结果、对各研究假设的影响、下一步和未解决问题。方向变化必须有依据，保留失败结果，不能将计划写成已完成。
