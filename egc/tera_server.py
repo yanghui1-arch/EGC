@@ -1,0 +1,408 @@
+"""User-run, single-GPU TERA experiment. Transformers only; no API/test-set calls."""
+import argparse
+from collections import Counter
+import hashlib
+import json
+import os
+from pathlib import Path
+import platform
+import subprocess
+import sys
+import time
+
+from .evaluate import compare, parse_output, summarize
+from .io import digest, read_json, read_rows, write_json, write_rows
+from .learned import fresh
+from .learned_server import DEFAULT_MODEL, check_prediction_identity, collect, execute, unpack
+from .qwen_eos_smoke import select_jobs
+from .server import SFT_TOKENIZATION_VERSION, configure_chat, environment, select_training_mode
+from .tera_data import VERSION, prompt_features, training_rows
+
+ARMS = ("direct", "generic", "tera_noaux", "tera")
+
+
+def file_hash(path):
+    with Path(path).open("rb") as handle:
+        checksum = hashlib.sha256()
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            checksum.update(chunk)
+        return checksum.hexdigest()
+
+
+def require_server():
+    if platform.system() != "Linux":
+        raise ValueError("Real training/inference runs only on the user's Linux server")
+    os.environ.setdefault("CUDA_VISIBLE_DEVICES", "1")
+    import torch
+    if int(os.environ.get("WORLD_SIZE", "1")) != 1 or not torch.cuda.is_available() or torch.cuda.device_count() != 1:
+        raise ValueError("Use exactly one visible CUDA GPU; default physical device is 1")
+    if not torch.cuda.is_bf16_supported():
+        raise ValueError("TERA v1 requires bf16 support")
+
+
+def tokenizer_for(model):
+    from transformers import AutoTokenizer
+    config = read_json(Path(model) / "config.json")
+    if config.get("model_type") != "qwen2" or config.get("quantization_config"):
+        raise ValueError("TERA v1 supports unquantized Qwen2/Qwen2.5 causal checkpoints only")
+    tokenizer = AutoTokenizer.from_pretrained(model, local_files_only=True, trust_remote_code=False, use_fast=True)
+    if not tokenizer.is_fast:
+        raise ValueError("Exact character offsets require a fast tokenizer")
+    return tokenizer, configure_chat(tokenizer, config)
+
+
+def prepare(data, model, max_length):
+    """Called by the user's server process; reuses private, already transferred data."""
+    tokenizer, protocol = tokenizer_for(model)
+    rows, report = training_rows(tokenizer, protocol, read_rows(data / "direct.train.sft.jsonl"),
+                                 read_rows(data / "bound.train.sft.jsonl"), max_length)
+    jobs = read_rows(data / "direct.dev.jobs.jsonl")
+    for job in jobs:
+        ids, _, _ = prompt_features(tokenizer, job["messages"])
+        if len(ids) + 2048 > max_length:
+            raise ValueError(f"Generation would exceed context budget: {job['id']}")
+    # These private files are excluded from result collection and Git publication.
+    write_rows(data / "tera.train.jsonl", rows)
+    report.update({"chat_protocol": protocol, "tokenization_version": SFT_TOKENIZATION_VERSION,
+                   "training_hash": digest(rows), "dev_jobs_hash": digest(jobs), "max_length": max_length,
+                   "new_api_calls": 0, "all_arms_same_sft_tokens": True})
+    print("Auxiliary alignment (not semantic accuracy):", json.dumps(report["alignment"]), flush=True)
+    if any(report["alignment"].get(role, 0) == 0 for role in ("target", "other", "uncertain")):
+        print("WARNING: at least one role has no aligned labels; this run cannot establish the full attribution mechanism", flush=True)
+    write_json(data.parent / "token_budget.json", report)
+    return report
+
+
+def load_model(model, arm, artifact=None):
+    import torch
+    from transformers import AutoModelForCausalLM
+    from .tera_model import MemoryCausalLM
+    full_reload = artifact and read_json(artifact / "module.json")["training_mode"] == "full"
+    backbone = AutoModelForCausalLM.from_pretrained(model, local_files_only=True, trust_remote_code=False,
+        torch_dtype=torch.float32 if full_reload else torch.bfloat16, attn_implementation="sdpa")
+    total = backbone.num_parameters()
+    mode = select_training_mode(total)
+    if mode == "lora":
+        from peft import LoraConfig, PeftModel, get_peft_model
+        if artifact:
+            backbone = PeftModel.from_pretrained(backbone, str(artifact / "backbone"), is_trainable=False)
+        else:
+            backbone = get_peft_model(backbone, LoraConfig(r=64, lora_alpha=128, lora_dropout=0.05,
+                target_modules=["q_proj", "k_proj", "v_proj", "o_proj"], task_type="CAUSAL_LM"))
+    elif not artifact:
+        backbone.float().requires_grad_(True)
+    elif Path(model).resolve() != (artifact / "backbone").resolve():
+        raise ValueError("Full-SFT inference must load the exported backbone")
+    wrapped = MemoryCausalLM(backbone, arm)
+    if artifact and wrapped.adapter is not None:
+        wrapped.adapter.load_state_dict(torch.load(artifact / "memory.pt", map_location="cpu", weights_only=True), strict=True)
+    return wrapped.cuda(), total, mode
+
+
+def collate(rows):
+    import torch
+    if len(rows) != 1:
+        raise ValueError("TERA v1 uses batch size one, with gradient accumulation")
+    row = rows[0]
+    return {"input_ids": torch.tensor([row["input_ids"]]), "labels": torch.tensor([row["labels"]]),
+            "meta": row["meta"], "role_labels": row["role_labels"]}
+
+
+def cache_probe(model, ids, meta):
+    """Real-checkpoint check: cached vs recomputed second-step logits; no gold input."""
+    import torch
+    model.eval()
+    tokens = torch.tensor([ids], device="cuda")
+    with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
+        first, memory, past = model.step(tokens, meta=meta)
+        next_id = first.argmax().reshape(1, 1)
+        cached, _, _ = model.step(next_id, memory=memory, past=past)
+        full = model.base.model(input_ids=torch.cat((tokens, next_id), 1), use_cache=False, return_dict=True).last_hidden_state[0]
+        tail = full[-1:]
+        memory_error = 0.0
+        if model.adapter is not None:
+            fresh_memory = model.adapter.memory(full, meta)
+            memory_error = max(float((fresh_memory[k].float() - memory[k].float()).abs().max()) for k in memory)
+            tail = model.adapter(tail, fresh_memory)
+        recomputed = model.base.lm_head(tail)[0].float()
+        error = float((cached - recomputed).abs().max())
+        if not torch.isfinite(recomputed).all() or error > 0.25 or memory_error > 0.25 or cached.argmax() != recomputed.argmax():
+            raise ValueError(f"Cached decode check failed: logits={error}, memory={memory_error}")
+        top = first.topk(8)
+        return {"cached_vs_full_max_abs": error, "memory_max_abs": memory_error,
+                "argmax_equal": True, "first_token": int(first.argmax()),
+                "first_top_ids": top.indices.tolist(), "first_top_logits": top.values.tolist(),
+                "note": "bf16 tolerance 0.25 and equal greedy token; two-step single-request check"}
+
+
+def train(data, output, model, arm, seed, epochs, max_steps, max_length):
+    require_server()
+    import torch
+    from transformers import Trainer, TrainerCallback, TrainingArguments, set_seed
+    from .tera_model import EvidenceAdapter
+    data, out = Path(data), fresh(output).resolve()
+    tokenizer, protocol = tokenizer_for(model)
+    rows = read_rows(data / "tera.train.jsonl")
+    budget = read_json(data.parent / "token_budget.json")
+    if digest(rows) != budget["training_hash"] or protocol != budget["chat_protocol"] or max_length != budget["max_length"]:
+        raise ValueError("Prepared data/protocol changed")
+    if any(len(r["input_ids"]) > max_length for r in rows):
+        raise ValueError("Overlength training case")
+    set_seed(seed)
+    network, total, mode = load_model(model, arm)
+    if network.config.max_position_embeddings < max_length:
+        raise ValueError("Requested context exceeds checkpoint configuration")
+    network.base.config.use_cache = False
+    sizes = {name: sum(p.numel() for p in EvidenceAdapter(network.config.hidden_size, generic=generic).parameters())
+             for name, generic in (("tera", False), ("generic", True))}
+    if sizes["tera"] >= 3_000_000 or abs(sizes["generic"] / sizes["tera"] - 1) > 0.05:
+        raise ValueError("Module parameter budget/control match failed")
+    manifest = {"version": VERSION, "arm": arm, "model": str(Path(model).resolve()), "training_mode": mode,
+                "total_parameters": total, "module_parameters": sizes, "aux_weight": network.aux_weight,
+                "trainable_parameters": sum(p.numel() for p in network.parameters() if p.requires_grad),
+                "training_hash": digest(rows), "seed": seed, "epochs": epochs, "max_steps": max_steps,
+                "max_length": max_length, "chat_protocol": protocol, "tokenization_version": SFT_TOKENIZATION_VERSION,
+                "optimizer": {"lr": 1e-5, "weight_decay": 0.0, "scheduler": "linear", "warmup_steps": 0},
+                "batch_size": 1, "grad_accum": 16, "checkpoint_selection": "final",
+                "environment": environment(root=model, gpu=True),
+                "cuda_visible_devices": os.environ["CUDA_VISIBLE_DEVICES"]}
+    write_json(out / "run_manifest.json", manifest)
+    print(json.dumps(manifest, ensure_ascii=False), flush=True)
+    gradient_checks = {}
+
+    class GradCheck(TrainerCallback):
+        def on_pre_optimizer_step(self, args, state, control, **kwargs):
+            if state.global_step > 1:
+                return
+            for group, params in (("backbone", network.backbone.parameters()),
+                                  ("module", network.adapter.parameters() if network.adapter else [])):
+                gradients = [p.grad for p in params if p.requires_grad and p.grad is not None]
+                if group == "module" and network.adapter is None:
+                    continue
+                if not gradients or any(not torch.isfinite(g).all() for g in gradients):
+                    raise ValueError(f"Missing/non-finite {group} gradients")
+                norm = max(float(g.abs().max()) for g in gradients)
+                if norm == 0:
+                    raise ValueError(f"Zero {group} gradients")
+                gradient_checks[f"step{state.global_step + 1}_{group}_max_abs"] = norm
+
+        def on_log(self, args, state, control, logs=None, **kwargs):
+            if logs is not None:
+                logs.update({"last_microbatch_" + k: v for k, v in network.last_losses.items()})
+
+    arguments = TrainingArguments(output_dir=str(out), num_train_epochs=epochs, max_steps=max_steps,
+        per_device_train_batch_size=1, gradient_accumulation_steps=16, learning_rate=1e-5,
+        weight_decay=0.0, warmup_steps=0, lr_scheduler_type="linear", optim="adamw_torch",
+        bf16=True, gradient_checkpointing=True, gradient_checkpointing_kwargs={"use_reentrant": False},
+        eval_strategy="no", save_strategy="no", logging_steps=1, report_to=["tensorboard"],
+        seed=seed, data_seed=seed, remove_unused_columns=False, dataloader_num_workers=0)
+    trainer = Trainer(model=network, args=arguments, train_dataset=rows, data_collator=collate, callbacks=[GradCheck()])
+    trainer.model_accepts_loss_kwargs = False  # loss averages each case; Trainer handles accumulation
+    torch.cuda.reset_peak_memory_stats()
+    started = time.time()
+    result = trainer.train()
+    if not gradient_checks:
+        raise ValueError("Trainer did not execute gradient checks; unsupported callback lifecycle")
+    network.eval()
+    module_update = float(network.adapter.up.weight.detach().abs().max()) if network.adapter else None
+    if module_update is not None and module_update == 0:
+        raise ValueError("Module residual remained zero after training")
+    probe_job = read_rows(data / "direct.dev.jobs.jsonl")[0]
+    ids, meta, _ = prompt_features(tokenizer, probe_job["messages"])
+    probe = cache_probe(network, ids, meta)
+    artifact = out / "artifact"
+    network.backbone.save_pretrained(artifact / "backbone", safe_serialization=True)
+    tokenizer.save_pretrained(artifact / "tokenizer")
+    if network.adapter is not None:
+        torch.save(network.adapter.state_dict(), artifact / "memory.pt")
+    write_json(artifact / "module.json", manifest)
+    checksums = {p.relative_to(artifact).as_posix(): file_hash(p) for p in artifact.rglob("*") if p.is_file()}
+    write_json(out / "completion.json", {"complete": True, "artifact": str(artifact), "arm": arm,
+        "training_mode": mode, "global_step": trainer.state.global_step, "train_metrics": result.metrics,
+        "module_up_max_abs": module_update,
+        "gradient_checks": gradient_checks, "cache_probe": probe, "artifact_sha256": checksums,
+        "seconds": time.time() - started, "peak_memory_gib": torch.cuda.max_memory_allocated() / 1024**3})
+
+
+def infer(data, trained, output, model, seed, max_length, smoke=False):
+    require_server()
+    import torch
+    from transformers import set_seed
+    trained, data, output = Path(trained), Path(data), Path(output)
+    if output.exists() or Path(str(output) + ".manifest.json").exists():
+        raise ValueError("Refusing to overwrite predictions")
+    done = read_json(trained / "completion.json")
+    if not done["complete"]:
+        raise ValueError("Training incomplete")
+    artifact = Path(done["artifact"])
+    actual = {p.relative_to(artifact).as_posix(): file_hash(p) for p in artifact.rglob("*") if p.is_file()}
+    if actual != done["artifact_sha256"]:
+        raise ValueError("Missing/changed backbone or module artifact")
+    manifest = read_json(artifact / "module.json")
+    if manifest["version"] != VERSION or manifest["model"] != str(Path(model).resolve()):
+        raise ValueError("Wrong module version/base model")
+    tokenizer, protocol = tokenizer_for(model)
+    if protocol != manifest["chat_protocol"]:
+        raise ValueError("Changed tokenization protocol")
+    jobs = read_rows(data / "direct.dev.jobs.jsonl")
+    if smoke:
+        jobs = select_jobs(jobs)
+    set_seed(seed)
+    load_path = str(artifact / "backbone") if done["training_mode"] == "full" else model
+    network, _, _ = load_model(load_path, manifest["arm"], artifact)
+    network.eval()
+    ids, meta, _ = prompt_features(tokenizer, jobs[0]["messages"])
+    probe = cache_probe(network, ids, meta)
+    original = done["cache_probe"]
+    if probe["first_top_ids"] != original["first_top_ids"] or max(abs(a-b) for a, b in zip(probe["first_top_logits"], original["first_top_logits"])) > 0.01:
+        raise ValueError("Save/reload logits changed")
+    settings = {"version": VERSION, "arm": manifest["arm"], "model": str(Path(model).resolve()),
+                "artifact_hash": digest(actual), "jobs_hash": digest(jobs), "training_hash": manifest["training_hash"],
+                "backend": "transformers_request_local_cache", "seed": seed, "temperature": 0,
+                "max_new_tokens": 2048, "max_model_len": max_length, "dtype": "bfloat16", "chat_protocol": protocol}
+    key = digest(settings)
+    sidecar = {"settings": settings, "generation_key": key, "save_reload_probe": probe}
+    write_json(str(output) + ".manifest.json", sidecar)
+    eos = network.config.eos_token_id
+    stops = set(eos if isinstance(eos, list) else [eos]) | set(protocol["stop_token_ids"])
+    predictions = []
+    with output.open("x", encoding="utf-8") as handle, torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
+        for index, job in enumerate(jobs, 1):
+            if job["prompt_hash"] != digest(job["messages"]) or job["split"] != "dev":
+                raise ValueError("Changed prompt or unfrozen split")
+            ids, meta, _ = prompt_features(tokenizer, job["messages"])
+            if len(ids) + 2048 > max_length:
+                raise ValueError("Overlength generation; no truncation")
+            memory = past = None
+            tokens = torch.tensor([ids], device="cuda")
+            generated, finish = [], "length"
+            routing = None
+            started = time.time()
+            for _ in range(2048):
+                logits, memory, past = network.step(tokens, meta=meta, memory=memory, past=past)
+                if routing is None and memory is not None:
+                    probabilities = memory["roles"].float().softmax(-1)
+                    routing = {"predicted_role_mean": probabilities.mean(0).tolist(),
+                        "role_entropy_mean": float(-(probabilities * probabilities.clamp_min(1e-8).log()).sum(-1).mean()),
+                        "sentences": len(probabilities), "semantic_accuracy": None}
+                token = int(logits.argmax())
+                generated.append(token)
+                if token in stops:
+                    finish = "stop"
+                    break
+                tokens = torch.tensor([[token]], device="cuda")
+            row = {"id": job["id"], "prompt_hash": job["prompt_hash"], "generation_key": key,
+                   "text": tokenizer.decode(generated, skip_special_tokens=True), "finish_reason": finish,
+                   "generated_tokens": len(generated), "prompt_tokens": len(ids), "seconds": time.time()-started}
+            if routing is not None:
+                row["routing_diagnostic"] = routing
+            handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+            handle.flush()
+            predictions.append(row)
+            del memory, past
+            print(f"{manifest['arm']}: dev {index}/{len(jobs)}, tokens={len(generated)}, finish={finish}", flush=True)
+    check_prediction_identity(jobs, predictions, sidecar)
+
+
+def evaluate(data, root):
+    refs = read_rows(data / "dev.references.jsonl")
+    jobs = read_rows(data / "direct.dev.jobs.jsonl")
+    predictions, metrics = {}, {}
+    for arm in ARMS:
+        path = root / f"{arm}.dev.predictions.jsonl"
+        predictions[arm] = read_rows(path)
+        check_prediction_identity(jobs, predictions[arm], read_json(str(path) + ".manifest.json"))
+        metrics[arm] = summarize(refs, predictions[arm])
+        metrics[arm]["predicted_months"] = dict(Counter(str(parse_output(p["text"])["sentence_months"])
+            for p in predictions[arm] if p["finish_reason"] == "stop" and parse_output(p["text"]) is not None))
+        metrics[arm]["by_charge"] = {charge: summarize([r for r in refs if r["charge"] == charge],
+            [p for p in predictions[arm] if p["id"] in {r["id"] for r in refs if r["charge"] == charge}])
+            for charge in sorted({r["charge"] for r in refs})}
+    comparisons = {}
+    for baseline, candidate in (("direct", "generic"), ("direct", "tera"), ("generic", "tera"), ("tera_noaux", "tera")):
+        comparisons[f"{candidate}_vs_{baseline}"] = compare(refs, predictions[baseline], predictions[candidate]) if all(
+            metrics[a]["eligible_for_full_mae_comparison"] for a in (baseline, candidate)) else {"eligible": False, "reason": "incomplete_valid_coverage"}
+    write_json(root / "dev.metrics.json", {"version": VERSION, "metrics": metrics, "comparisons": comparisons,
+        "limitations": "Single seed; weak-label semantics unverified; no original-paper reproduction; no test evaluation"})
+
+
+def run(archive, output, model=DEFAULT_MODEL, seed=42, epochs=3, max_length=8192, smoke_only=False):
+    require_server()
+    if epochs <= 0 or max_length <= 2048:
+        raise ValueError("Invalid experiment budget")
+    out = fresh(output).resolve()
+    model = str(Path(model).resolve())
+    commit = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True)
+    record = {"version": VERSION, "model": model, "seed": seed, "epochs": epochs, "max_length": max_length,
+              "archive_sha256": file_hash(archive), "git_commit": commit.stdout.strip() if commit.returncode == 0 else None,
+              "cuda_visible_devices": os.environ["CUDA_VISIBLE_DEVICES"], "arms": ARMS,
+              "smoke_only": smoke_only, "commands": [], "phase": "prepare"}
+    write_json(out / "execution.json", record)
+    def launch(command, name):
+        record["phase"] = name
+        write_json(out / "execution.json", record)
+        record["commands"].append(execute(command, out / f"logs/{name}.log"))
+        write_json(out / "execution.json", record)
+    try:
+        unpack(archive, out / "data")
+        prepare(out / "data", model, max_length)
+        common = ["--data", str(out / "data"), "--model", model, "--seed", str(seed), "--max-length", str(max_length)]
+        def pair(arm, smoke=False):
+            name = "smoke" if smoke else arm
+            train_cmd = [sys.executable, "-m", "egc.tera_server", "train"] + common + ["--output", str(out / name),
+                        "--arm", arm, "--epochs", str(epochs), "--max-steps", "32" if smoke else "-1"]
+            launch(train_cmd, "train_" + name)
+            infer_cmd = [sys.executable, "-m", "egc.tera_server", "infer"] + common + ["--trained", str(out / name),
+                        "--output", str(out / f"{name}.dev.predictions.jsonl")]
+            launch(infer_cmd + (["--smoke"] if smoke else []), "infer_" + name)
+        pair("tera", smoke=True)
+        predictions = read_rows(out / "smoke.dev.predictions.jsonl")
+        valid = sum(p["finish_reason"] == "stop" and parse_output(p["text"]) is not None for p in predictions)
+        gate = {"n": len(predictions), "valid": valid, "passed": len(predictions) == 12 and valid == 12,
+                "note": "32 steps / 12 dev cases: termination check only, no benchmark score"}
+        write_json(out / "smoke.metrics.json", gate)
+        if not gate["passed"]:
+            raise ValueError("Smoke termination gate failed; full runs not started")
+        if not smoke_only:
+            for arm in ARMS:
+                pair(arm)  # Fresh base + fresh module; never resume the smoke weights.
+            evaluate(out / "data", out)
+        record["phase"] = "complete_smoke" if smoke_only else "complete_dev"
+        write_json(out / "completion.json", {"complete": True, "phase": record["phase"], "test_evaluated": False})
+    except Exception as exc:
+        write_json(out / "failure.json", {"phase": record["phase"], "error_type": type(exc).__name__, "message": str(exc)})
+        raise
+    finally:
+        write_json(out / "execution.json", record)
+        print("Return experiment evidence:", collect(out), flush=True)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    commands = parser.add_subparsers(dest="command", required=True)
+    for name in ("run", "train", "infer"):
+        sub = commands.add_parser(name)
+        sub.add_argument("--model", default=DEFAULT_MODEL)
+        sub.add_argument("--output", required=True)
+        sub.add_argument("--seed", type=int, default=42)
+        sub.add_argument("--max-length", type=int, default=8192)
+        if name in ("run", "train"):
+            sub.add_argument("--epochs", type=int, default=3)
+        if name == "run":
+            sub.add_argument("--archive", required=True)
+            sub.add_argument("--smoke-only", action="store_true")
+        else:
+            sub.add_argument("--data", required=True)
+        if name == "train":
+            sub.add_argument("--arm", choices=ARMS, required=True)
+            sub.add_argument("--max-steps", type=int, default=-1)
+        if name == "infer":
+            sub.add_argument("--trained", required=True)
+            sub.add_argument("--smoke", action="store_true")
+    args = vars(parser.parse_args())
+    command = args.pop("command")
+    {"run": run, "train": train, "infer": infer}[command](**args)
+
+
+if __name__ == "__main__":
+    main()
