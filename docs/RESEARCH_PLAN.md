@@ -1,5 +1,7 @@
 # EGC科研主记录：创新点、实验计划与进度
 
+**2026-09-28 缓存诊断已验收，当前下一步为组级恢复：** 回传results_1790611081946904296.zip（SHA256 ebcfa97fb00579812766db197853bcb4a5620efe2cabdfef63375160ef26ebc1），26证据成员及数据/训练/预测身份核验通过，详见[诊断报告](TERA_CACHE_RESULT.md)。smoke/direct/generic已保存，后两组各894步；tera_noaux旧进程训练后未导出，无法恢复；完整tera尚未训练。BF16三个模型最大差0.3125/0.4375/0.375，36位置greedy全一致，FP32最大差≤0.00010872且12位置greedy一致，支持已保存组的精度路径差异，不能直接证明丢失组无错。已将BF16绝对差改为诊断项，统一采用4位置BF16 greedy/memory检查加FP32严格数值对照（logit≤0.001/memory≤0.0001，禁用TF32）；不是原门槛通过，不改训练/解码。新增run --resume，核验并复用已有权重/预测，重训无导出的tera_noaux及新训tera；保留旧记录，检查前保存继续有效。14项相关CPU合成检查通过，真实GPU恢复待用户运行。direct/generic均527/528有效，同一例达到2048上限，完整MAE不可报；不删除失败样本或称模块已有效。下一步执行[恢复命令](RUN_TERA.md)并回传新ZIP；H5与四组/3%门槛不变，test仍冻结。
+
 **2026-09-28 TERA训练后缓存检查失败（当前下一步）：** 用户附件日志定位到`runs/tera_qwen25_7b_seed42_20260928_181851_23453/logs/train_tera_noaux.log`，显示epoch3/训练耗时约3174秒后，在cache_probe出现logits最大差0.3125、memory差0，超出原0.25门槛。日志未给出argmax/主干/精度对照，原因未定，不能称BF16误报或模块失效；尚未收到这轮ZIP逐项验收。原顺序是检查后才保存，且无中途checkpoint，故失败组可能丢失未导出的权重，这是保存顺序缺陷。已改为缓存检查前保存artifact与hash，training_complete/validation_status分开，失败保持complete=false；补充主干、模块增量、greedy token/margin和RMS诊断，阈值不变。新增只读`egc.tera_server diagnose-cache --run-dir ...`复用保存组：固定前三个dev输入×4续接位置，第一例另做同权重FP32/禁用TF32对照，检查缺失artifact，不训练/API/评分/改写权重。11项相关CPU合成检查在Transformers5.17下通过；尚无真实GPU诊断和方法增益。下一步用户仅执行RUN_TERA.md顶部诊断命令并回传新results_<时间>.zip，暂不整套重训、不手动提高门槛。流程上smoke/direct/generic已走过，实际可复用产物待核验；若失败组没有checkpoint则无法恢复其内存权重，后续只重做必要组。自动恢复入口尚未新增；H5假设、四组对照和test冻结不变。
 
 **2026-09-28 TERA启动兼容修复（当前下一步）：** 用户确认专注新增模块有效性，并回传GPU 1小试启动失败日志。日志显示数据准备完成（target14453/other934/uncertain249；unlabelled16520、冲突110、跨块引用1670、重复引用13），这些是对齐计数，不是语义准确率；尚未收到该TERA结果ZIP逐项核验。Qwen2.5-7B基座及模块加载完成，新增可训练总数42,327,816；Trainer在首个训练步前向MemoryCausalLM.gradient_checkpointing_enable传入every_n_layers时抛TypeError，故没有TERA训练/效果结论。已修复共享包装方法，原样转发every_n_layers、offload等kwargs到底层，不禁用checkpoint、不丢弃参数或改训练超参。新增四组参数透传/未知参数拒绝回归，且在隔离安装的Transformers5.17.0、PEFT0.20.0、Accelerate1.15.0、Torch2.6 CPU上8项TERA合成检查通过（无skip），包括实际Trainer两步和PEFT梯度/保存重载；真实A100/Torch2.13仍待重试。下一步用户git pull后原命令CUDA_VISIBLE_DEVICES=1 bash scripts/server_tera.sh，新时间戳目录保留旧故障证据；无需重洗/调用API，不重跑H4。H5结构、对照与判定标准保持不变。
@@ -319,3 +321,5 @@ B0冻结协议`configs/b0_protocol.json`绑定v6 dev哈希及112行总体，从�
 | 2026-09-28，TERA无辅助损失组训练后检查中断 | 用户日志显示3epochs完成后cache_probe差0.3125>0.25、memory0；缺少greedy/主干精度对照，未取得结果ZIP。旧代码检查前不导出且无中途保存 | 修复缓存检查前保存，失败保留权重但不评分；新增只读已保存模型诊断及FP32对照，11项相关CPU检查通过。用户先返回新诊断ZIP，再确定数值原因和可复用组；不调高门槛、不整套重训、不声称恢复旧未保存权重。模块有效性未验证，test仍冻结 |
 
 后续记录应写清操作/实验ID、输入及配置版本、实际结果、对各研究假设的影响、下一步和未解决问题。方向变化必须有依据，保留失败结果，不能将计划写成已完成。
+
+| 2026-09-28，缓存诊断验收与组级恢复 | 已保存3组36个BF16位置greedy一致，direct也有0.4375差；FP32三组最大差≤0.00010872。noaux无导出，tera未训；direct/generic同一例超长，各527/528有效 | 明确修订缓存验收为BF16行为+FP32数值对照，不改训练/解码；14项CPU检查通过。用户run --resume复核并复用已完成组，仅补缺失两组；无完整H5效果，覆盖率问题保留，test不解冻 |

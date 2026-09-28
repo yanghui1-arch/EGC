@@ -68,6 +68,49 @@ class DataTests(unittest.TestCase):
 
 
 class OrchestrationTests(unittest.TestCase):
+    def test_resume_revalidates_saved_arms_retrains_only_missing_and_preserves_failure(self):
+        from egc.tera_server import run
+        from egc.tera_data import VERSION
+        from egc.server import SFT_TOKENIZATION_VERSION
+        import hashlib
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp).resolve()
+            archive = root / "input.zip"
+            archive.write_bytes(b"synthetic")
+            out = root / "run"
+            execution = {"version": VERSION, "model": str(root), "seed": 42, "epochs": 3,
+                "max_length": 8192, "archive_sha256": hashlib.sha256(b"synthetic").hexdigest(), "smoke_only": False}
+            write_json(out / "execution.json", execution)
+            write_json(out / "failure.json", {"old_failure": True})
+            write_rows(out / "data/tera.train.jsonl", [{"id": "synthetic"}])
+            training_hash = digest([{"id": "synthetic"}])
+            write_json(out / "token_budget.json", {"training_hash": training_hash, "chat_protocol": {}})
+            for name in ("smoke", "direct", "generic", "tera_noaux"):
+                write_json(out / name / "run_manifest.json", execution | {"arm": "tera" if name == "smoke" else name,
+                    "max_steps": 32 if name == "smoke" else -1, "training_hash": training_hash,
+                    "chat_protocol": {}, "tokenization_version": SFT_TOKENIZATION_VERSION})
+                if name != "tera_noaux":
+                    write_json(out / name / "completion.json", {"complete": True})
+                    write_rows(out / f"{name}.dev.predictions.jsonl", [{"id": str(i),
+                        "text": '{"reasoning":"ok","sentence_months":12}', "finish_reason": "stop"} for i in range(12)])
+            original_predictions = (out / "direct.dev.predictions.jsonl").read_bytes()
+            commands = []
+            with patch("egc.tera_server.require_server"), patch("egc.learned_audit.checked_zip", return_value={}), \
+                 patch("egc.tera_server.execute", side_effect=lambda command, log: commands.append(command) or {"exit_code": 0}), \
+                 patch("egc.tera_server.evaluate"), patch("egc.tera_server.collect", return_value="synthetic.zip"), \
+                 patch("egc.tera_server.prepare") as prepare, patch.dict("os.environ", {"CUDA_VISIBLE_DEVICES": "1"}):
+                run(archive, out, model=root, resume=True)
+                self.assertEqual([c[c.index("--arm")+1] for c in commands if c[3] == "train"], ["tera_noaux", "tera"])
+                self.assertEqual(sum("--validate-only" in c for c in commands), 3)
+                prepare.assert_not_called()
+                self.assertEqual((out / "direct.dev.predictions.jsonl").read_bytes(), original_predictions)
+                self.assertEqual(len(list(out.glob("failed_tera_noaux_*/run_manifest.json"))), 1)
+                self.assertEqual(len(list(out.glob("failure_before_resume_*.metrics.json"))), 1)
+                commands.clear()
+                with self.assertRaisesRegex(ValueError, "mismatch: seed"):
+                    run(archive, out, model=root, seed=7, resume=True)
+                self.assertEqual(commands, [])
+
     def test_readonly_diagnostic_inventory_fixed_inputs_and_no_training(self):
         from types import SimpleNamespace
         from unittest.mock import Mock
@@ -217,6 +260,71 @@ class ModelTests(unittest.TestCase):
         self.assertGreater(report["steps"][0]["module_increment_difference_max_abs"], 0.3)
         self.assertLess(report["steps"][0]["backbone_max_abs"], 1e-5)
 
+    def test_precision_validation_checks_fp32_and_restores_mixed_dtypes_on_error(self):
+        from egc.tera_server import validate_cache
+        model = self.model.eval()
+        model.backbone.bfloat16()
+        model.register_buffer("synthetic_bf16_buffer", torch.ones(2, dtype=torch.bfloat16))
+        before = {n: t.clone() for n, t in model.state_dict().items()}
+        bf16 = {"passed": False, "argmax_equal": True, "memory_max_abs": 0.01, "cached_vs_full_max_abs": 0.4375}
+        fp32 = {"passed": True, "argmax_equal": True, "memory_max_abs": 0., "cached_vs_full_max_abs": 0.0001}
+        old_tf32 = torch.backends.cuda.matmul.allow_tf32
+        for control, accepted in ((fp32, True), (fp32 | {"cached_vs_full_max_abs": .01}, False)):
+            with patch("egc.tera_server.cache_probe", side_effect=[bf16, control]) as probe:
+                report = validate_cache(model, [], {})
+            self.assertEqual(report["passed"], accepted)
+            self.assertFalse(report["legacy_absolute_gate_passed"])
+            self.assertEqual(probe.call_args.kwargs, {"steps": 4, "precision": "fp32"})
+        with patch("egc.tera_server.cache_probe", side_effect=[bf16 | {"argmax_equal": False}, fp32]):
+            self.assertFalse(validate_cache(model, [], {})["passed"])
+        with patch("egc.tera_server.cache_probe", side_effect=[bf16, RuntimeError("synthetic failure")]):
+            with self.assertRaises(RuntimeError):
+                validate_cache(model, [], {})
+        self.assertEqual(torch.backends.cuda.matmul.allow_tf32, old_tf32)
+        for n, tensor in model.state_dict().items():
+            self.assertEqual(tensor.dtype, before[n].dtype)
+            self.assertTrue(torch.equal(tensor, before[n]))
+        # The actual tiny model exercises the FP32 control, not only mocked reports.
+        model.float()
+        self.assertTrue(validate_cache(model, self.ids[0, :8].tolist(), self.meta)["passed"])
+
+    def test_saved_prediction_revalidation_is_readonly_and_checks_identity(self):
+        from egc.tera_server import infer, cache_probe, file_hash
+        from egc.tera_data import VERSION
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp).resolve()
+            data, trained = root / "data", root / "direct"
+            artifact = trained / "artifact"
+            ids = self.ids[0, :8].tolist()
+            probe = cache_probe(self.model, ids, self.meta)
+            manifest = {"version": VERSION, "model": str(root), "arm": "direct", "chat_protocol": {},
+                        "training_hash": "synthetic", "seed": 42, "max_length": 8192}
+            write_json(artifact / "module.json", manifest)
+            checks = {"module.json": file_hash(artifact / "module.json")}
+            write_json(trained / "completion.json", {"complete": True, "artifact": str(artifact),
+                "artifact_sha256": checks, "training_mode": "lora", "cache_probe": probe})
+            jobs = [{"id": "x", "messages": [], "prompt_hash": digest([])}]
+            write_rows(data / "direct.dev.jobs.jsonl", jobs)
+            write_json(root / "token_budget.json", {"training_hash": "synthetic", "dev_jobs_hash": digest(jobs)})
+            settings = {"version": VERSION, "model": str(root), "arm": "direct", "artifact_hash": digest(checks),
+                "jobs_hash": digest(jobs), "training_hash": "synthetic", "backend": "transformers_request_local_cache",
+                "seed": 42, "temperature": 0, "max_new_tokens": 2048, "max_model_len": 8192,
+                "dtype": "bfloat16", "chat_protocol": {}}
+            output = root / "direct.dev.predictions.jsonl"
+            write_rows(output, [{"id": "x", "prompt_hash": digest([]), "generation_key": digest(settings)}])
+            sidecar = str(output) + ".manifest.json"
+            write_json(sidecar, {"settings": settings, "generation_key": digest(settings)})
+            before = {p: p.read_bytes() for p in (output, Path(sidecar), trained / "completion.json", artifact / "module.json")}
+            with patch("egc.tera_server.require_server"), patch("egc.tera_server.tokenizer_for", return_value=(None, {})), \
+                 patch("egc.tera_server.prompt_features", return_value=(ids, self.meta, [])), \
+                 patch("egc.tera_server.load_model", return_value=(self.model, 1, "lora")):
+                infer(data, trained, output, root, 42, 8192, validate_only=True)
+                self.assertTrue(all(p.read_bytes() == b for p, b in before.items()))
+                self.assertEqual(len(list(root.glob("*.revalidated_*.metrics.json"))), 1)
+                write_json(sidecar, {"settings": settings | {"max_new_tokens": 4096}, "generation_key": digest(settings)})
+                with self.assertRaisesRegex(ValueError, "settings differ"):
+                    infer(data, trained, output, root, 42, 8192, validate_only=True)
+
     def test_post_training_failure_preserves_weights_and_incomplete_status(self):
         from types import SimpleNamespace
         from egc.tera_server import finish_training, file_hash
@@ -232,7 +340,7 @@ class ModelTests(unittest.TestCase):
                     if fail == "exception":
                         raise RuntimeError("synthetic diagnostic failure")
                     return {"passed": False, "cached_vs_full_max_abs": 0.3125}
-                with patch("egc.tera_server.cache_probe", side_effect=probe), self.assertRaises((ValueError, RuntimeError)):
+                with patch("egc.tera_server.validate_cache", side_effect=probe), self.assertRaises((ValueError, RuntimeError)):
                     finish_training(self.model, tokenizer, out, {"arm": "tera"}, {"global_step": 894}, [], {})
                 done = read_json(out / "completion.json")
                 self.assertFalse(done["complete"])

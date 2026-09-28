@@ -1,5 +1,27 @@
 # GPU 1：TERA模块先导实验
 
+**2026-09-28当前操作：诊断已验收，恢复缺失实验组。** 详见[缓存验收](TERA_CACHE_RESULT.md)。已保存组的BF16差异在FP32下显著下降，新增统一精度对照验收及组级恢复；14项相关CPU检查通过，真实恢复仍待运行。direct/generic权重和预测可在核验后复用；tera_noaux无导出需重训，完整tera尚未开始。无需API或本机处理，不要重新运行整套server_tera.sh。
+
+服务器执行：
+
+```bash
+cd /mnt/yanghui/EGC
+git pull --ff-only
+CUDA_VISIBLE_DEVICES=1 python -m egc.tera_server run \
+  --archive data/learned_v2_screened/experiment.zip \
+  --output runs/tera_qwen25_7b_seed42_20260928_181851_23453 \
+  --model /mnt/yanghui/models/Qwen/Qwen2.5-7B \
+  --seed 42 --epochs 3 --max-length 8192 --resume
+```
+
+顺序：核对源包和准备数据 → 重新加载smoke/direct/generic做同一缓存验收并保留其原预测 → 保存旧失败目录 → 从基座重训tera_noaux、新训tera，各3epochs并生成528 dev → 汇总四组。新版继续在缓存检查前导出权重，失败也保留；不会恢复旧noaux已经丢失的权重。BF16解码、LoRA和训练预算不变；FP32只用于短缓存检查，退出前恢复原dtype，不写回权重。发现已有部分预测或不完整导出会停下，不静默覆盖。
+
+结束或失败时将终端最后`Return experiment evidence:`后提示的**新results_<时间>.zip**放到本机`D:\workspace\codes\COLING\EGC\runs`。旧ZIP和失败日志保留。direct/generic当前均527/528有效，完整MAE不可报告；恢复不替换这条失败预测。没有TERA提升结论，正式test不运行。
+
+---
+
+以下是历史诊断及完整新建实验说明，已被上面的恢复步骤取代。
+
 **2026-09-28最新：暂不重跑整套训练，先诊断训练后缓存检查。** 用户日志显示`tera_noaux`的3epochs训练已返回，随后缓存检查报`logits=0.3125, memory=0.0`。旧门槛为最大绝对差0.25；日志没有argmax、主干误差或精度对照，不能确定是BF16数值差异还是缓存/模块错误。旧代码在该检查后才保存artifact，且save_strategy=no，因此失败组可能没有可恢复权重；先检查文件清单，不承诺恢复。此前的smoke/direct/generic按流程已走过，实际文件和结果仍需核验。
 
 现已将权重导出移动到缓存检查之前，completion.json分别记录training_complete与validation_status。缓存检查失败时保留artifact和校验和，但complete仍为false，不进入生成评分；此修复无法追溯恢复已经退出进程中的旧权重。检查报告新增相同权重/相同续接token下的主干logit差、模块增量差、argmax及margin、最大误差token和RMS。**没有放宽0.25门槛，也没有更改模型/训练/解码设置。**

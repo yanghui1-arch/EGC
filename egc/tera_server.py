@@ -178,7 +178,7 @@ def finish_training(network, tokenizer, out, manifest, completion, ids, meta):
                         "artifact": str(artifact), "artifact_sha256": checksums}
     write_json(out / "completion.json", done)
     try:
-        done["cache_probe"] = cache_probe(network, ids, meta)
+        done["cache_probe"] = validate_cache(network, ids, meta)
         if not done["cache_probe"]["passed"]:
             raise ValueError("Cached decode check failed; trained weights preserved; inspect completion.json cache_probe")
         done.update(complete=True, validation_status="passed")
@@ -187,6 +187,32 @@ def finish_training(network, tokenizer, out, manifest, completion, ids, meta):
         raise
     finally:
         write_json(out / "completion.json", done)
+
+
+def validate_cache(network, ids, meta):
+    """BF16 decoding agreement plus an independent FP32 cache correctness check."""
+    import torch
+    report = cache_probe(network, ids, meta, steps=4)
+    original_parameters = {name: tensor.dtype for name, tensor in network.named_parameters() if tensor.is_floating_point()}
+    original_buffers = {name: tensor.dtype for name, tensor in network.named_buffers() if tensor.is_floating_point()}
+    tf32 = torch.backends.cuda.matmul.allow_tf32
+    try:
+        torch.backends.cuda.matmul.allow_tf32 = False
+        network.float()
+        control = cache_probe(network, ids, meta, steps=4, precision="fp32")
+    finally:
+        # Restore each dtype separately: LoRA/module FP32 parameters must stay FP32.
+        for names, getter in ((original_parameters, network.get_parameter), (original_buffers, network.get_buffer)):
+            for name, dtype in names.items():
+                tensor = getter(name)
+                tensor.data = tensor.data.to(dtype=dtype)
+        torch.backends.cuda.matmul.allow_tf32 = tf32
+    return report | {"validation_version": "bf16-greedy-fp32-cache-v1",
+        "legacy_absolute_gate_passed": report["passed"], "fp32_control": control,
+        "passed": report["argmax_equal"] and report["memory_max_abs"] <= 0.25
+                  and control["argmax_equal"] and control["cached_vs_full_max_abs"] <= 1e-3
+                  and control["memory_max_abs"] <= 1e-4,
+        "note": "Four continuations: BF16 greedy agreement/memory<=0.25; FP32 logits<=0.001, memory<=0.0001, greedy agreement; TF32 disabled. BF16 absolute error is diagnostic, not the gate."}
 
 
 def train(data, output, model, arm, seed, epochs, max_steps, max_length):
@@ -270,17 +296,19 @@ def train(data, output, model, arm, seed, epochs, max_steps, max_length):
         "seconds": time.time() - started, "peak_memory_gib": torch.cuda.max_memory_allocated() / 1024**3}, ids, meta)
 
 
-def infer(data, trained, output, model, seed, max_length, smoke=False):
+def infer(data, trained, output, model, seed, max_length, smoke=False, validate_only=False):
     require_server()
     import torch
     from transformers import set_seed
     trained, data, output = Path(trained), Path(data), Path(output)
-    if output.exists() or Path(str(output) + ".manifest.json").exists():
+    if not validate_only and (output.exists() or Path(str(output) + ".manifest.json").exists()):
         raise ValueError("Refusing to overwrite predictions")
     done = read_json(trained / "completion.json")
-    if not done["complete"]:
+    if not (done["complete"] or done.get("training_complete")):
         raise ValueError("Training incomplete")
     artifact = Path(done["artifact"])
+    if artifact.resolve() != (trained / "artifact").resolve():
+        raise ValueError("Foreign artifact path")
     actual = {p.relative_to(artifact).as_posix(): file_hash(p) for p in artifact.rglob("*") if p.is_file()}
     if actual != done["artifact_sha256"]:
         raise ValueError("Missing/changed backbone or module artifact")
@@ -291,6 +319,10 @@ def infer(data, trained, output, model, seed, max_length, smoke=False):
     if protocol != manifest["chat_protocol"]:
         raise ValueError("Changed tokenization protocol")
     jobs = read_rows(data / "direct.dev.jobs.jsonl")
+    budget = read_json(data.parent / "token_budget.json")
+    if (digest(jobs) != budget["dev_jobs_hash"] or manifest["training_hash"] != budget["training_hash"]
+            or manifest["seed"] != seed or manifest["max_length"] != max_length):
+        raise ValueError("Changed inference experiment identity")
     if smoke:
         jobs = select_jobs(jobs)
     set_seed(seed)
@@ -298,7 +330,7 @@ def infer(data, trained, output, model, seed, max_length, smoke=False):
     network, _, _ = load_model(load_path, manifest["arm"], artifact)
     network.eval()
     ids, meta, _ = prompt_features(tokenizer, jobs[0]["messages"])
-    probe = cache_probe(network, ids, meta)
+    probe = validate_cache(network, ids, meta)
     if not probe["passed"]:
         write_json(output.with_suffix(".cache.metrics.json"), probe)
         raise ValueError("Cached decode check failed; inspect saved cache.metrics.json; weights are unchanged")
@@ -311,6 +343,14 @@ def infer(data, trained, output, model, seed, max_length, smoke=False):
                 "max_new_tokens": 2048, "max_model_len": max_length, "dtype": "bfloat16", "chat_protocol": protocol}
     key = digest(settings)
     sidecar = {"settings": settings, "generation_key": key, "save_reload_probe": probe}
+    if validate_only:
+        existing = read_json(str(output) + ".manifest.json")
+        if existing["settings"] != settings:
+            raise ValueError("Existing prediction settings differ; refusing reuse")
+        check_prediction_identity(jobs, read_rows(output), existing)
+        write_json(output.parent / f"{output.stem}.revalidated_{time.time_ns()}.metrics.json", sidecar)
+        print("Revalidated saved weights and reused predictions:", output, flush=True)
+        return
     write_json(str(output) + ".manifest.json", sidecar)
     eos = network.config.eos_token_id
     stops = set(eos if isinstance(eos, list) else [eos]) | set(protocol["stop_token_ids"])
@@ -458,35 +498,74 @@ def diagnose_cache(run_dir):
     return report
 
 
-def run(archive, output, model=DEFAULT_MODEL, seed=42, epochs=3, max_length=8192, smoke_only=False):
+def run(archive, output, model=DEFAULT_MODEL, seed=42, epochs=3, max_length=8192, smoke_only=False, resume=False):
     require_server()
     if epochs <= 0 or max_length <= 2048:
         raise ValueError("Invalid experiment budget")
-    out = fresh(output).resolve()
+    out = Path(output).resolve() if resume else fresh(output).resolve()
     model = str(Path(model).resolve())
     commit = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True)
     record = {"version": VERSION, "model": model, "seed": seed, "epochs": epochs, "max_length": max_length,
               "archive_sha256": file_hash(archive), "git_commit": commit.stdout.strip() if commit.returncode == 0 else None,
               "cuda_visible_devices": os.environ["CUDA_VISIBLE_DEVICES"], "arms": ARMS,
               "smoke_only": smoke_only, "commands": [], "phase": "prepare"}
+    if resume:
+        from .learned_audit import checked_zip
+        previous = read_json(out / "execution.json")
+        for key in ("version", "model", "seed", "epochs", "max_length", "archive_sha256", "smoke_only"):
+            if previous[key] != record[key]:
+                raise ValueError(f"Resume experiment mismatch: {key}")
+        for name, content in checked_zip(archive).items():
+            if (out / "data" / name).read_bytes() != content:
+                raise ValueError(f"Changed original experiment data: {name}")
+        budget = read_json(out / "token_budget.json")
+        if digest(read_rows(out / "data/tera.train.jsonl")) != budget["training_hash"]:
+            raise ValueError("Changed prepared training data")
+        write_json(out / f"execution_before_resume_{time.time_ns()}.metrics.json", previous)
+        record["resumed_from_execution_hash"] = digest(previous)
+        if (out / "failure.json").exists():
+            (out / "failure.json").rename(out / f"failure_before_resume_{time.time_ns()}.metrics.json")
     write_json(out / "execution.json", record)
     def launch(command, name):
         record["phase"] = name
         write_json(out / "execution.json", record)
-        record["commands"].append(execute(command, out / f"logs/{name}.log"))
+        suffix = f"_{time.time_ns()}" if resume else ""
+        record["commands"].append(execute(command, out / f"logs/{name}{suffix}.log"))
         write_json(out / "execution.json", record)
     try:
-        unpack(archive, out / "data")
-        prepare(out / "data", model, max_length)
+        if not resume:
+            unpack(archive, out / "data")
+            prepare(out / "data", model, max_length)
         common = ["--data", str(out / "data"), "--model", model, "--seed", str(seed), "--max-length", str(max_length)]
         def pair(arm, smoke=False):
             name = "smoke" if smoke else arm
+            trained = out / name
+            prediction = out / f"{name}.dev.predictions.jsonl"
             train_cmd = [sys.executable, "-m", "egc.tera_server", "train"] + common + ["--output", str(out / name),
                         "--arm", arm, "--epochs", str(epochs), "--max-steps", "32" if smoke else "-1"]
-            launch(train_cmd, "train_" + name)
+            saved = resume and (trained / "completion.json").exists()
+            if resume and prediction.exists() and not saved:
+                raise ValueError("Predictions exist without their saved training artifact")
+            if resume and trained.exists():
+                manifest = read_json(trained / "run_manifest.json")
+                expected = {"version": VERSION, "arm": arm, "model": model, "seed": seed,
+                    "epochs": epochs, "max_steps": 32 if smoke else -1, "max_length": max_length,
+                    "training_hash": budget["training_hash"], "chat_protocol": budget["chat_protocol"],
+                    "tokenization_version": SFT_TOKENIZATION_VERSION}
+                if any(manifest.get(k) != v for k, v in expected.items()):
+                    raise ValueError(f"Cannot reuse mismatched training: {name}")
+                if not saved:
+                    if (trained / "artifact").exists():
+                        raise ValueError(f"Incomplete export in {name}; preserve and inspect before retrying")
+                    # Keep failed logs/TensorBoard/manifest; never delete an unfinished run.
+                    trained.rename(out / f"failed_{name}_{time.time_ns()}")
+            if not saved:
+                launch(train_cmd, "train_" + name)
             infer_cmd = [sys.executable, "-m", "egc.tera_server", "infer"] + common + ["--trained", str(out / name),
                         "--output", str(out / f"{name}.dev.predictions.jsonl")]
-            launch(infer_cmd + (["--smoke"] if smoke else []), "infer_" + name)
+            reuse = resume and prediction.exists()
+            launch(infer_cmd + (["--smoke"] if smoke else []) + (["--validate-only"] if reuse else []),
+                   ("revalidate_" if reuse else "infer_") + name)
         pair("tera", smoke=True)
         predictions = read_rows(out / "smoke.dev.predictions.jsonl")
         valid = sum(p["finish_reason"] == "stop" and parse_output(p["text"]) is not None for p in predictions)
@@ -525,6 +604,7 @@ def main():
         if name == "run":
             sub.add_argument("--archive", required=True)
             sub.add_argument("--smoke-only", action="store_true")
+            sub.add_argument("--resume", action="store_true")
         else:
             sub.add_argument("--data", required=True)
         if name == "train":
@@ -533,6 +613,7 @@ def main():
         if name == "infer":
             sub.add_argument("--trained", required=True)
             sub.add_argument("--smoke", action="store_true")
+            sub.add_argument("--validate-only", action="store_true")
     args = vars(parser.parse_args())
     command = args.pop("command")
     {"run": run, "train": train, "infer": infer, "diagnose-cache": diagnose_cache}[command](**args)
