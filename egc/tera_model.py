@@ -82,8 +82,10 @@ class MemoryCausalLM(nn.Module):
     def base(self):
         return self.backbone.get_base_model() if hasattr(self.backbone, "get_base_model") else self.backbone
 
-    def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None):
-        self.backbone.gradient_checkpointing_enable(gradient_checkpointing_kwargs=gradient_checkpointing_kwargs)
+    def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None, **kwargs):
+        # Preserve the installed Transformers contract, including layer stride/offload.
+        return self.backbone.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs=gradient_checkpointing_kwargs, **kwargs)
 
     def forward(self, input_ids, labels, meta, role_labels):
         if input_ids.shape[0] != 1 or input_ids.shape != labels.shape:

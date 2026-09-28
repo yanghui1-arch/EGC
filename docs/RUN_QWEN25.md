@@ -1,5 +1,7 @@
 # 首轮改用Qwen2.5-7B
 
+**2026-09-28已完成：** 原生EOS三组完整dev结果已回传并核验，各528/528有效；MAE direct15.4830、flat14.8087、bound14.7254。见[完整报告](QWEN25_NATIVE_EOS_RESULT.md)。下面命令保留为历史记录，无需重跑；下一步专注[GPU 1 TERA](RUN_TERA.md)。
+
 **2026-09-27当前执行：原生EOS小试12/12通过，开始完整dev复核。** 数据包和预测身份已核验，详见[验收结果](QWEN25_DEV_RESULT.md)。运行下面命令，从同一基座分别新训direct/flat/bound各3epochs，并生成frozen及三组全部528 dev结果；保留旧实验和小试目录。
 
 ```bash

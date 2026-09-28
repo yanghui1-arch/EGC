@@ -1,5 +1,7 @@
 # GPU 1：TERA模块先导实验
 
+**2026-09-28启动错误已修复：** 首轮服务器在Trainer.train启用gradient checkpointing时因包装方法不接受every_n_layers而退出，尚无训练步。现原样转发包括every_n_layers/offload在内的kwargs到底层；无需降级Transformers或关闭checkpoint。8项相关合成检查已在Transformers5.17.0/PEFT0.20.0/Accelerate1.15.0及CPU Torch2.6通过，包括实际Trainer训练和四组透传回归；真实A100兼容性待重试。用户日志说明准备阶段已完成，不能把它当训练完成。保留runs/tera_qwen25_7b_seed42_20260928_180425_23415；拉取后执行下方原命令即可自动生成新目录。torch_dtype弃用警告不导致此次退出。接口依据[Transformers5.17官方签名](https://huggingface.co/docs/transformers/v5.17.0/en/main_classes/model#transformers.PreTrainedModel.gradient_checkpointing_enable)。
+
 2026-09-28：代码已实现，149项离线检查通过；没有真实TERA训练/benchmark结果。创新假设仍见[研究主记录](RESEARCH_PLAN.md)与[结构及文献](MODULE_RESEARCH_2025_2026.md)。本次只新增独立入口，未修改正在GPU 0运行的H4代码。
 
 ## 在服务器运行

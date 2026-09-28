@@ -188,6 +188,25 @@ class ModelTests(unittest.TestCase):
             self.assertTrue(torch.isfinite(self.model.adapter.up.weight).all())
             self.assertGreater(self.model.adapter.up.weight.abs().sum().item(), 0)
 
+    def test_checkpoint_options_forwarded_without_dropping_or_swallowing(self):
+        received = []
+        def modern_api(gradient_checkpointing_kwargs=None, every_n_layers=1, offload=False):
+            received.append((gradient_checkpointing_kwargs, every_n_layers, offload))
+            return "enabled"
+        for arm in ("direct", "generic", "tera_noaux", "tera"):
+            from egc.tera_model import MemoryCausalLM
+            model = MemoryCausalLM(self.model.base, arm, rank=8)
+            with patch.object(model.backbone, "gradient_checkpointing_enable", side_effect=modern_api):
+                self.assertEqual(model.gradient_checkpointing_enable(
+                    gradient_checkpointing_kwargs={"use_reentrant": False}, every_n_layers=2, offload=True), "enabled")
+                self.assertEqual(received[-1], ({"use_reentrant": False}, 2, True))
+                with self.assertRaises(TypeError):
+                    model.gradient_checkpointing_enable(unknown_option=True)
+        # Old callers supply only the checkpoint kwargs; defaults are left to the backbone.
+        with patch.object(self.model.backbone, "gradient_checkpointing_enable") as old_api:
+            self.model.gradient_checkpointing_enable({"use_reentrant": False})
+            old_api.assert_called_once_with(gradient_checkpointing_kwargs={"use_reentrant": False})
+
     def test_real_peft_gradient_reload_and_interleaved_requests(self):
         try:
             from peft import LoraConfig, PeftModel, get_peft_model
