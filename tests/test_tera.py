@@ -99,7 +99,7 @@ class OrchestrationTests(unittest.TestCase):
                  patch("egc.tera_server.execute", side_effect=lambda command, log: commands.append(command) or {"exit_code": 0}), \
                  patch("egc.tera_server.evaluate"), patch("egc.tera_server.collect", return_value="synthetic.zip"), \
                  patch("egc.tera_server.prepare") as prepare, patch.dict("os.environ", {"CUDA_VISIBLE_DEVICES": "1"}):
-                run(archive, out, model=root, resume=True)
+                run(archive, out, model=root, resume=True, skip_laic=True)
                 self.assertEqual([c[c.index("--arm")+1] for c in commands if c[3] == "train"], ["tera_noaux", "tera"])
                 self.assertEqual(sum("--validate-only" in c for c in commands), 3)
                 prepare.assert_not_called()
@@ -157,6 +157,8 @@ class OrchestrationTests(unittest.TestCase):
             commands = []
             def execute(command, log):
                 commands.append(command)
+                if command[2] == "egc.tera_benchmark":
+                    return {"exit_code": 0}
                 out = Path(command[command.index("--output") + 1])
                 if command[3] == "infer":
                     write_rows(out, [{"id": str(i), "text": '{"reasoning":"ok","sentence_months":12}', "finish_reason": "stop"} for i in range(12)])
@@ -165,10 +167,11 @@ class OrchestrationTests(unittest.TestCase):
                  patch("egc.tera_server.execute", side_effect=execute), patch("egc.tera_server.evaluate") as score, \
                  patch("egc.tera_server.collect", return_value="synthetic_results.zip"), patch.dict("os.environ", {"CUDA_VISIBLE_DEVICES": "1"}):
                 run(archive, root / "run", model=root)
-                self.assertEqual(len(commands), 10)
+                self.assertEqual(len(commands), 11)
+                self.assertEqual(commands[-1][2], "egc.tera_benchmark")
                 self.assertIn("32", commands[0])
-                self.assertEqual([c[c.index("--arm")+1] for c in commands[2::2]], list(ARMS))
-                self.assertTrue(all("-1" in c for c in commands[2::2]))
+                self.assertEqual([c[c.index("--arm")+1] for c in commands[2:10:2]], list(ARMS))
+                self.assertTrue(all("-1" in c for c in commands[2:10:2]))
                 score.assert_called_once()
                 with patch("egc.tera_server.read_rows", return_value=[{"text": "bad", "finish_reason": "length"}]):
                     with self.assertRaisesRegex(ValueError, "Smoke termination"):
@@ -296,6 +299,7 @@ class ModelTests(unittest.TestCase):
             data, trained = root / "data", root / "direct"
             artifact = trained / "artifact"
             ids = self.ids[0, :8].tolist()
+            self.model.config.max_position_embeddings = 32768
             probe = cache_probe(self.model, ids, self.meta)
             manifest = {"version": VERSION, "model": str(root), "arm": "direct", "chat_protocol": {},
                         "training_hash": "synthetic", "seed": 42, "max_length": 8192}
@@ -324,6 +328,23 @@ class ModelTests(unittest.TestCase):
                 write_json(sidecar, {"settings": settings | {"max_new_tokens": 4096}, "generation_key": digest(settings)})
                 with self.assertRaisesRegex(ValueError, "settings differ"):
                     infer(data, trained, output, root, 42, 8192, validate_only=True)
+            # LAIC inputs differ from dev; reload verification must still use the saved dev probe.
+            refs = [{"id": "laic-a", "split": "test", "facts": "甲实施行为。", "charge": "示例", "sentence_months": 12}]
+            prompts = messages(refs[0], "direct")
+            test_jobs = [{"id": "laic-a", "split": "test", "variant": "direct", "messages": prompts,
+                          "prompt_hash": digest(prompts)}]
+            write_rows(data / "test0.references.jsonl", refs)
+            write_rows(data / "direct.test0.jobs.jsonl", test_jobs)
+            write_json(data / "manifest.json", {"tests": [{"name": "test0", "n": 1, "hash": digest(refs)}]})
+            write_json(root / "token_budget.json", {"training_hash": "synthetic", "dev_jobs_hash": digest(jobs), "max_length": 8192})
+            test_settings = settings | {"jobs_hash": digest(test_jobs), "split": "test0", "max_model_len": 32768}
+            test_output = root / "direct.test0.predictions.jsonl"
+            write_rows(test_output, [{"id": "laic-a", "prompt_hash": digest(prompts), "generation_key": digest(test_settings)}])
+            write_json(str(test_output) + ".manifest.json", {"settings": test_settings, "generation_key": digest(test_settings)})
+            with patch("egc.tera_server.require_server"), patch("egc.tera_server.tokenizer_for", return_value=(None, {})), \
+                 patch("egc.tera_server.prompt_features", side_effect=lambda tok, msgs: (ids[::-1] if msgs else ids, self.meta, [])), \
+                 patch("egc.tera_server.load_model", return_value=(self.model, 1, "lora")):
+                infer(data, trained, test_output, root, 42, 32768, validate_only=True, split="test0")
 
     def test_post_training_failure_preserves_weights_and_incomplete_status(self):
         from types import SimpleNamespace

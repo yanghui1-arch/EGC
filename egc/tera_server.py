@@ -1,4 +1,4 @@
-"""User-run, single-GPU TERA experiment. Transformers only; no API/test-set calls."""
+"""User-run, single-GPU TERA experiment. Transformers only; no API calls."""
 import argparse
 from collections import Counter
 import hashlib
@@ -296,7 +296,29 @@ def train(data, output, model, arm, seed, epochs, max_steps, max_length):
         "seconds": time.time() - started, "peak_memory_gib": torch.cuda.max_memory_allocated() / 1024**3}, ids, meta)
 
 
-def infer(data, trained, output, model, seed, max_length, smoke=False, validate_only=False):
+def frozen_jobs(data, split):
+    """Check frozen references and reconstruct only the permitted input fields."""
+    from .learned import messages
+    from .io import index_unique
+    if split not in ("test0", "test1", "test2"):
+        raise ValueError("Unknown frozen split")
+    entries = [t for t in read_json(data / "manifest.json")["tests"] if t["name"] == split]
+    if len(entries) != 1:
+        raise ValueError("Missing/duplicate benchmark manifest entry")
+    refs = read_rows(data / f"{split}.references.jsonl")
+    jobs = read_rows(data / f"direct.{split}.jobs.jsonl")
+    index_unique(refs)
+    index_unique(jobs)
+    if len(refs) != entries[0]["n"] or digest(refs) != entries[0]["hash"]:
+        raise ValueError("Frozen reference identity changed")
+    expected = [{"id": r["id"], "split": "test", "variant": "direct", "messages": messages(r, "direct"),
+                 "prompt_hash": digest(messages(r, "direct"))} for r in refs]
+    if any(r["split"] != "test" for r in refs) or jobs != expected:
+        raise ValueError("Frozen prompts changed or contain noncanonical fields")
+    return jobs
+
+
+def infer(data, trained, output, model, seed, max_length, smoke=False, validate_only=False, split="dev"):
     require_server()
     import torch
     from transformers import set_seed
@@ -318,18 +340,29 @@ def infer(data, trained, output, model, seed, max_length, smoke=False, validate_
     tokenizer, protocol = tokenizer_for(model)
     if protocol != manifest["chat_protocol"]:
         raise ValueError("Changed tokenization protocol")
-    jobs = read_rows(data / "direct.dev.jobs.jsonl")
+    dev_jobs = read_rows(data / "direct.dev.jobs.jsonl")
     budget = read_json(data.parent / "token_budget.json")
-    if (digest(jobs) != budget["dev_jobs_hash"] or manifest["training_hash"] != budget["training_hash"]
-            or manifest["seed"] != seed or manifest["max_length"] != max_length):
+    if (digest(dev_jobs) != budget["dev_jobs_hash"] or manifest["training_hash"] != budget["training_hash"]
+            or manifest["seed"] != seed or manifest["max_length"] != (max_length if split == "dev" else budget["max_length"])):
         raise ValueError("Changed inference experiment identity")
+    if smoke and split != "dev":
+        raise ValueError("Smoke selection is dev-only")
+    jobs = dev_jobs if split == "dev" else frozen_jobs(data, split)
     if smoke:
         jobs = select_jobs(jobs)
+    if split != "dev":
+        for job in jobs:
+            ids, _, _ = prompt_features(tokenizer, job["messages"])
+            if len(ids) + 2048 > max_length:
+                raise ValueError("Frozen benchmark exceeds context; no truncation or case removal")
     set_seed(seed)
     load_path = str(artifact / "backbone") if done["training_mode"] == "full" else model
     network, _, _ = load_model(load_path, manifest["arm"], artifact)
+    if max_length > network.config.max_position_embeddings:
+        raise ValueError("Inference context exceeds checkpoint configuration")
     network.eval()
-    ids, meta, _ = prompt_features(tokenizer, jobs[0]["messages"])
+    # The saved reload fingerprint belongs to dev[0], never to the first test case.
+    ids, meta, _ = prompt_features(tokenizer, (jobs if split == "dev" else dev_jobs)[0]["messages"])
     probe = validate_cache(network, ids, meta)
     if not probe["passed"]:
         write_json(output.with_suffix(".cache.metrics.json"), probe)
@@ -341,6 +374,8 @@ def infer(data, trained, output, model, seed, max_length, smoke=False, validate_
                 "artifact_hash": digest(actual), "jobs_hash": digest(jobs), "training_hash": manifest["training_hash"],
                 "backend": "transformers_request_local_cache", "seed": seed, "temperature": 0,
                 "max_new_tokens": 2048, "max_model_len": max_length, "dtype": "bfloat16", "chat_protocol": protocol}
+    if split != "dev":
+        settings["split"] = split
     key = digest(settings)
     sidecar = {"settings": settings, "generation_key": key, "save_reload_probe": probe}
     if validate_only:
@@ -357,7 +392,7 @@ def infer(data, trained, output, model, seed, max_length, smoke=False, validate_
     predictions = []
     with output.open("x", encoding="utf-8") as handle, torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
         for index, job in enumerate(jobs, 1):
-            if job["prompt_hash"] != digest(job["messages"]) or job["split"] != "dev":
+            if job["prompt_hash"] != digest(job["messages"]) or job["split"] != ("dev" if split == "dev" else "test"):
                 raise ValueError("Changed prompt or unfrozen split")
             ids, meta, _ = prompt_features(tokenizer, job["messages"])
             if len(ids) + 2048 > max_length:
@@ -389,16 +424,16 @@ def infer(data, trained, output, model, seed, max_length, smoke=False, validate_
             handle.flush()
             predictions.append(row)
             del memory, past
-            print(f"{manifest['arm']}: dev {index}/{len(jobs)}, tokens={len(generated)}, finish={finish}", flush=True)
+            print(f"{manifest['arm']}: {split} {index}/{len(jobs)}, tokens={len(generated)}, finish={finish}", flush=True)
     check_prediction_identity(jobs, predictions, sidecar)
 
 
-def evaluate(data, root):
-    refs = read_rows(data / "dev.references.jsonl")
-    jobs = read_rows(data / "direct.dev.jobs.jsonl")
+def evaluate(data, root, split="dev"):
+    jobs = read_rows(data / "direct.dev.jobs.jsonl") if split == "dev" else frozen_jobs(data, split)
+    refs = read_rows(data / f"{split}.references.jsonl")
     predictions, metrics = {}, {}
     for arm in ARMS:
-        path = root / f"{arm}.dev.predictions.jsonl"
+        path = root / f"{arm}.{split}.predictions.jsonl"
         predictions[arm] = read_rows(path)
         check_prediction_identity(jobs, predictions[arm], read_json(str(path) + ".manifest.json"))
         metrics[arm] = summarize(refs, predictions[arm])
@@ -411,8 +446,9 @@ def evaluate(data, root):
     for baseline, candidate in (("direct", "generic"), ("direct", "tera"), ("generic", "tera"), ("tera_noaux", "tera")):
         comparisons[f"{candidate}_vs_{baseline}"] = compare(refs, predictions[baseline], predictions[candidate]) if all(
             metrics[a]["eligible_for_full_mae_comparison"] for a in (baseline, candidate)) else {"eligible": False, "reason": "incomplete_valid_coverage"}
-    write_json(root / "dev.metrics.json", {"version": VERSION, "metrics": metrics, "comparisons": comparisons,
-        "limitations": "Single seed; weak-label semantics unverified; no original-paper reproduction; no test evaluation"})
+    write_json(root / f"{split}.metrics.json", {"version": VERSION, "metrics": metrics, "comparisons": comparisons,
+        "limitations": "Single seed; weak-label semantics unverified; no original-paper reproduction; "
+                        + ("no test evaluation" if split == "dev" else "CAIL-trained external benchmark; not the paper's training protocol")})
 
 
 def diagnose_cache(run_dir):
@@ -498,7 +534,7 @@ def diagnose_cache(run_dir):
     return report
 
 
-def run(archive, output, model=DEFAULT_MODEL, seed=42, epochs=3, max_length=8192, smoke_only=False, resume=False):
+def run(archive, output, model=DEFAULT_MODEL, seed=42, epochs=3, max_length=8192, smoke_only=False, resume=False, skip_laic=False):
     require_server()
     if epochs <= 0 or max_length <= 2048:
         raise ValueError("Invalid experiment budget")
@@ -586,6 +622,10 @@ def run(archive, output, model=DEFAULT_MODEL, seed=42, epochs=3, max_length=8192
     finally:
         write_json(out / "execution.json", record)
         print("Return experiment evidence:", collect(out), flush=True)
+    if not smoke_only and not skip_laic:
+        # Separate process/output: benchmark failure must not invalidate completed training/dev.
+        execute([sys.executable, "-m", "egc.tera_benchmark", "--run-dir", str(out), "--resume"],
+                out / f"logs/laic_{time.time_ns()}.log")
 
 
 def main():
@@ -605,6 +645,7 @@ def main():
             sub.add_argument("--archive", required=True)
             sub.add_argument("--smoke-only", action="store_true")
             sub.add_argument("--resume", action="store_true")
+            sub.add_argument("--skip-laic", action="store_true", help="Skip the default post-training LAIC evaluation")
         else:
             sub.add_argument("--data", required=True)
         if name == "train":
@@ -614,6 +655,7 @@ def main():
             sub.add_argument("--trained", required=True)
             sub.add_argument("--smoke", action="store_true")
             sub.add_argument("--validate-only", action="store_true")
+            sub.add_argument("--split", choices=("dev", "test0", "test1", "test2"), default="dev")
     args = vars(parser.parse_args())
     command = args.pop("command")
     {"run": run, "train": train, "infer": infer, "diagnose-cache": diagnose_cache}[command](**args)

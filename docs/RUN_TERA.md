@@ -1,5 +1,32 @@
 # GPU 1：TERA模块先导实验
 
+**2026-09-29最新：用户授权立即评LAIC，并在后续完整训练后自动评测。** 已实现`egc.tera_benchmark`，复用已保存的四组权重，仅做测试推理，不重新训练/API。以下命令在空闲GPU 0评已完成的seed42，与GPU 1的seed43/44训练分开：
+
+```bash
+cd /mnt/yanghui/EGC
+git pull --ff-only
+CUDA_VISIBLE_DEVICES=0 python -m egc.tera_benchmark \
+  --run-dir runs/tera_qwen25_7b_seed42_20260928_181851_23453
+```
+
+默认输出`原run目录/laic_test/`，四组`*.test0.predictions.jsonl`及身份文件、`test0.metrics.json`（MAE/RMSE/覆盖率/分罪名/配对区间）、预检和日志。结束或失败均打印`Return LAIC evidence:`的ZIP路径；首次为`原run目录/laic_test/results.zip`。将其另命名为`tera_seed42_laic_results.zip`放回本机`EGC/runs/`，不要与原dev包混淆。不会改写原权重、训练数据或dev预测。
+
+**自动衔接：** 新代码启动的`python -m egc.tera_server run ...`或`bash scripts/server_tera.sh`默认在四组训练和dev评测完成后，同一GPU顺序运行LAIC；不需要新增参数。32步smoke-only不触发LAIC，显式`--skip-laic`可只做开发阶段。低层`train`子命令不单独自动测试。LAIC使用单独子进程和结果目录，失败不会把已完成训练/dev标成失败；原训练根目录的`completion.json`仍描述dev阶段，测试完成以`laic_test/completion.json`为准。
+
+已经启动的旧父进程不会追加入新尾部步骤；若seed43/44完成后没有`laic_test`结果，对其**准确run目录**执行同一个`egc.tera_benchmark --run-dir ...`即可补测，不要重训。新加载的后续run会采用自动LAIC默认值；不同run的测试目录互不共享。
+
+测试协议：核验冻结LAIC的1200例hash与规范输入字段、四组完整训练身份/权重hash/模板；先检查全部输入长度，再加载模型。使用完整事实、batch1、BF16 greedy、输出上限2048，统一上下文上限32768（区别于训练/dev的8192）；超过预算就失败并报告，不截断或删除案例。保存重载/FP32缓存核验仍用原dev第一例，不将LAIC第一例误作训练时指纹。四组固定最终epoch，不以LAIC分数选择权重；理由字符ROUGE仅诊断，不当论文官方生成指标。PCCD/CAIL120本次不自动运行。
+
+默认拒绝覆盖结果；`--resume`仅在输入/配置身份不变时复核并复用已有完整组，继续缺失组。已有部分预测会停止并保留证据，不静默清空重跑。15项相关CPU合成检查通过（Transformers5.17/PEFT0.20），实际LAIC GPU推理、上下文覆盖与指标均待用户回传。
+
+**科研状态变更：** 按用户要求提前开放LAIC并常规报告，原“先完成机制检查再解冻LAIC”的安排被取代。若后续依据LAIC调整模块或超参，应将其视为已观察的benchmark并披露，不能仍声称是未接触的最终测试；PCCD继续保留，后续确认协议另行固定。CAIL训练→LAIC测试仍是跨来源评估，不能直接声称复现或超过论文的同训练数据结果。
+
+---
+
+以下为先前计划和历史记录，执行以本页顶部为准。
+
+**最终测试安排（2026-09-29）：** 本文当前命令仅训练4757例并评CAIL来源528例dev；seed42/43/44不是LAIC测试。现有实验包已包含冻结LAIC1200（test0）、PCCD100（test1）、CAIL120（test2）。完成开发阶段并冻结配置后，以LAIC为主要外部benchmark统一评四组，PCCD作补充；TERA专用test入口及长度预检尚待实现，当前不要将旧H4的test命令用于TERA。CAIL训练→LAIC测试需明确报告为跨来源评估；与原论文比较还需同条件LCR对照。此计划不改变正在运行的seed43/44命令。
+
 **2026-09-29当前下一步：seed42已验收，固定配置补seed43/44。** 详见[结果报告](TERA_SEED42_RESULT.md)。无需再次恢复seed42。新两轮使用同一数据包、模型、四组对照与训练/解码设置；有改善信号，但尚未确认最强基线优势和机制有效性。
 
 在服务器GPU 1顺序执行两轮（真实作业由用户运行）：
