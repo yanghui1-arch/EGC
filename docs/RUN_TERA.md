@@ -1,5 +1,29 @@
 # GPU 1：TERA模块先导实验
 
+**2026-09-29当前下一步：seed42已验收，固定配置补seed43/44。** 详见[结果报告](TERA_SEED42_RESULT.md)。无需再次恢复seed42。新两轮使用同一数据包、模型、四组对照与训练/解码设置；有改善信号，但尚未确认最强基线优势和机制有效性。
+
+在服务器GPU 1顺序执行两轮（真实作业由用户运行）：
+
+```bash
+cd /mnt/yanghui/EGC
+git pull --ff-only
+for seed in 43 44; do
+  CUDA_VISIBLE_DEVICES=1 python -m egc.tera_server run \
+    --archive data/learned_v2_screened/experiment.zip \
+    --output "runs/tera_qwen25_7b_seed${seed}_$(date +%Y%m%d_%H%M%S)" \
+    --model /mnt/yanghui/models/Qwen/Qwen2.5-7B \
+    --seed "$seed" --epochs 3 --max-length 8192 || break
+done
+```
+
+每轮先32步/12例小试，再从基座新训direct/generic/tera_noaux/tera并评528 dev；seed只改变训练随机性，数据划分不变。新目录不加resume，不续训seed42。任一轮失败即停止，保留权重和日志并回传失败包。
+
+每轮最后会打印`Return experiment evidence:`路径。将两个结果ZIP分别命名为`tera_seed43_results.zip`、`tera_seed44_results.zip`放回本机`D:\workspace\codes\COLING\EGC\runs`；改ZIP外部文件名不改变内部校验。不要覆盖seed42结果，不额外调用DeepSeek，不运行test。
+
+下面保留seed42恢复与历史诊断说明；当前执行以上新种子命令。原论文同配置复现、60例标注审阅、去目标/路由干预仍未完成，不能将多seed运行等同于这些工作。
+
+---
+
 **2026-09-28当前操作：诊断已验收，恢复缺失实验组。** 详见[缓存验收](TERA_CACHE_RESULT.md)。已保存组的BF16差异在FP32下显著下降，新增统一精度对照验收及组级恢复；14项相关CPU检查通过，真实恢复仍待运行。direct/generic权重和预测可在核验后复用；tera_noaux无导出需重训，完整tera尚未开始。无需API或本机处理，不要重新运行整套server_tera.sh。
 
 服务器执行：
