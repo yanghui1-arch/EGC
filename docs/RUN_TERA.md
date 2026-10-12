@@ -1,4 +1,48 @@
-# GPU 1：TERA模块先导实验
+# GPU：TERA实验
+
+**2026-10-12最新：TERA v2（潜在目标指针+数值MBR解码）已实现，尚未在GPU上运行。** 设计、依据和归因边界见[TERA_V2.md](TERA_V2.md)。以下全部由用户在服务器执行；无API调用，不重新标注。两张卡可以并行跑下面的A和B，互不依赖。如果seed43/44仍占着GPU1，就先跑B，等GPU1空闲再跑A。
+
+```bash
+cd /mnt/yanghui/EGC
+git pull --ff-only
+```
+
+**A. v2四组完整实验（GPU1，预计约20小时）**
+
+```bash
+# 1) 从服务器已有v1包生成去目标包（纯本地重打包，几十秒，无GPU/API）
+python -m egc.correct_training   --archive data/learned_v2_screened/experiment.zip   --output data/learned_v3_latent
+# 2) smoke → direct/generic/tera_noaux/tera 各从基座训练3 epochs → 528 dev → LAIC/PCCD/CAIL
+CUDA_VISIBLE_DEVICES=1 python -m egc.tera_server run   --archive data/learned_v3_latent/experiment.zip   --output "runs/tera_v2_qwen25_7b_seed42_$(date +%Y%m%d_%H%M%S)"   --model /mnt/yanghui/models/Qwen/Qwen2.5-7B   --seed 42 --epochs 3 --max-length 8192
+```
+
+- 输入：`data/learned_v2_screened/experiment.zip`（应为SHA256 `55e6eb8c…`，脚本会写进correction.json）。输出：`data/learned_v3_latent/{experiment.zip,correction.json}`和新的run目录。
+- 训练超参、LoRA、上下文、BF16、2048输出上限都与v1相同。dev和测试统一使用MBR解码；greedy整数在同一次生成中一并记录，`*.metrics.json`同时给出两套结果。
+- 训练/dev结束时打印`Return experiment evidence:`（`run目录/results.zip`）；随后自动评测三个测试集，结束时打印`Return benchmark evidence:`（`run目录/benchmark_mbr/results.zip`）。
+
+**B. 只换解码、不训练：v1 seed42已保存权重（GPU0，预计约16小时，可按split分批）**
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python -m egc.tera_benchmark   --run-dir runs/tera_qwen25_7b_seed42_20260928_181851_23453   --splits dev test1 test2 test0 --decoding mbr
+```
+
+- 输出到`原run目录/benchmark_mbr/`，不改原权重或预测。每个split跑完就立即评分，中断后加`--resume`续跑；输入身份不变时已完成的组只做复核。
+- 用途：(1) greedy整数应逐例复现已有dev/LAIC预测，作为软件核验；(2) 测量单靠解码的变化；(3) 第一次给出v1在PCCD/CAIL上的结果。
+
+**需要回传的文件（放到本机`EGC/runs/`）：**
+
+| 文件 | 改名为 |
+|---|---|
+| A的`run目录/results.zip` | `tera_v2_seed42_dev_results.zip` |
+| A的`run目录/benchmark_mbr/results.zip` | `tera_v2_seed42_tests_results.zip` |
+| B的`原run目录/benchmark_mbr/results.zip` | `tera_v1_seed42_mbr_results.zip` |
+| `data/learned_v3_latent/correction.json` | 原名 |
+
+这些结果包只含指标、预测、清单和日志，不含权重或训练输入。失败时同样会打印结果包路径，把失败包和终端最后约50行一起发回。seed43/44如已完成，也请回传它们原来的结果包。
+
+---
+
+以下为先前计划和历史记录，执行以本页顶部为准。
 
 **2026-09-29最新：用户授权立即评LAIC，并在后续完整训练后自动评测。** 已实现`egc.tera_benchmark`，复用已保存的四组权重，仅做测试推理，不重新训练/API。以下命令在空闲GPU 0评已完成的seed42，与GPU 1的seed43/44训练分开：
 

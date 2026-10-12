@@ -1,6 +1,7 @@
 """Synthetic, offline checks only: no API, pretrained checkpoint or benchmark data."""
 import copy
 import json
+import math
 from pathlib import Path
 import tempfile
 import unittest
@@ -79,7 +80,8 @@ class OrchestrationTests(unittest.TestCase):
             archive.write_bytes(b"synthetic")
             out = root / "run"
             execution = {"version": VERSION, "model": str(root), "seed": 42, "epochs": 3,
-                "max_length": 8192, "archive_sha256": hashlib.sha256(b"synthetic").hexdigest(), "smoke_only": False}
+                "max_length": 8192, "archive_sha256": hashlib.sha256(b"synthetic").hexdigest(), "smoke_only": False,
+                "decoding": "mbr"}
             write_json(out / "execution.json", execution)
             write_json(out / "failure.json", {"old_failure": True})
             write_rows(out / "data/tera.train.jsonl", [{"id": "synthetic"}])
@@ -99,9 +101,10 @@ class OrchestrationTests(unittest.TestCase):
                  patch("egc.tera_server.execute", side_effect=lambda command, log: commands.append(command) or {"exit_code": 0}), \
                  patch("egc.tera_server.evaluate"), patch("egc.tera_server.collect", return_value="synthetic.zip"), \
                  patch("egc.tera_server.prepare") as prepare, patch.dict("os.environ", {"CUDA_VISIBLE_DEVICES": "1"}):
-                run(archive, out, model=root, resume=True, skip_laic=True)
+                run(archive, out, model=root, resume=True, skip_tests=True)
                 self.assertEqual([c[c.index("--arm")+1] for c in commands if c[3] == "train"], ["tera_noaux", "tera"])
                 self.assertEqual(sum("--validate-only" in c for c in commands), 3)
+                self.assertTrue(all(c[c.index("--decoding") + 1] == "mbr" for c in commands if c[3] == "infer"))
                 prepare.assert_not_called()
                 self.assertEqual((out / "direct.dev.predictions.jsonl").read_bytes(), original_predictions)
                 self.assertEqual(len(list(out.glob("failed_tera_noaux_*/run_manifest.json"))), 1)
@@ -195,7 +198,7 @@ class ModelTests(unittest.TestCase):
         torch.manual_seed(42)
         base = Qwen2ForCausalLM(Qwen2Config(vocab_size=97, hidden_size=32, intermediate_size=48,
             num_hidden_layers=2, num_attention_heads=4, num_key_value_heads=2, max_position_embeddings=128))
-        self.model = MemoryCausalLM(base, "tera", rank=8)
+        self.model = MemoryCausalLM(base, "tera", rank=8, target_mode="explicit")
         self.meta = {"prompt_length": 8, "sentences": [[1, 2], [3, 4]], "charge": [0], "target": [6]}
         self.ids = torch.tensor([[5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]])
 
@@ -371,7 +374,7 @@ class ModelTests(unittest.TestCase):
 
     def test_generic_does_not_route_by_aux_labels_and_parameter_budget(self):
         from egc.tera_model import EvidenceAdapter
-        generic = EvidenceAdapter(32, rank=8, generic=True)
+        generic = EvidenceAdapter(32, rank=8, generic=True, target_mode="explicit")
         torch.nn.init.normal_(generic.up.weight)
         hidden = torch.randn(11, 32)
         memory = generic.memory(hidden, self.meta)
@@ -399,6 +402,42 @@ class ModelTests(unittest.TestCase):
             self.assertTrue(torch.isfinite(self.model.adapter.up.weight).all())
             self.assertGreater(self.model.adapter.up.weight.abs().sum().item(), 0)
 
+    def test_balanced_sentence_loss_and_missing_target_gradients(self):
+        from egc.tera_model import MemoryCausalLM
+        from egc.tera_server import collate
+        meta = dict(self.meta, target=[])
+        row = {"input_ids": self.ids[0].tolist(), "labels": [-100]*8 + [13, 14, 15],
+               "meta": meta, "role_labels": [0, 1], "sentence_mask": [False]*8 + [True, False, False]}
+        for arm in ("direct", "generic", "tera_noaux", "tera"):
+            model = MemoryCausalLM(self.model.base, arm, rank=8, target_mode="explicit").eval()
+            model.zero_grad()
+            if model.adapter is not None:
+                # After the first optimizer update, generation also reaches the missing-target gate.
+                torch.nn.init.normal_(model.adapter.up.weight, std=.01)
+            result = model(**collate([row]))
+            self.assertAlmostEqual(model.last_losses["sft"],
+                .5 * (model.last_losses["sentence"] + model.last_losses["rest"]), places=5)
+            if arm == "direct":
+                h = model.base.model(self.ids, use_cache=False).last_hidden_state[0][7:-1]
+                ce = torch.nn.functional.cross_entropy(model.base.lm_head(h).float(), torch.tensor([13, 14, 15]), reduction="none")
+                torch.testing.assert_close(result["loss"], .5*ce[0] + .5*ce[1:].mean())
+            result["loss"].backward()
+            if model.adapter is not None:
+                self.assertGreater(model.adapter.missing_target.grad.abs().sum().item(), 0)
+            with self.assertRaisesRegex(ValueError, "loss mask"):
+                model(**(collate([row]) | {"sentence_mask": torch.ones_like(self.ids, dtype=torch.bool)}))
+        from transformers import Trainer, TrainingArguments
+        with tempfile.TemporaryDirectory() as temp:
+            args = TrainingArguments(output_dir=temp, use_cpu=True, max_steps=2,
+                per_device_train_batch_size=1, gradient_accumulation_steps=2, report_to=[],
+                save_strategy="no", logging_strategy="no", remove_unused_columns=False,
+                dataloader_pin_memory=False, disable_tqdm=True)
+            trainer = Trainer(model=self.model, args=args, train_dataset=[row]*4, data_collator=collate)
+            trainer.model_accepts_loss_kwargs = False
+            trainer.train()
+            self.assertEqual(trainer.state.global_step, 2)
+            self.assertIn("sentence", self.model.last_losses)
+
     def test_checkpoint_options_forwarded_without_dropping_or_swallowing(self):
         received = []
         def modern_api(gradient_checkpointing_kwargs=None, every_n_layers=1, offload=False):
@@ -406,7 +445,7 @@ class ModelTests(unittest.TestCase):
             return "enabled"
         for arm in ("direct", "generic", "tera_noaux", "tera"):
             from egc.tera_model import MemoryCausalLM
-            model = MemoryCausalLM(self.model.base, arm, rank=8)
+            model = MemoryCausalLM(self.model.base, arm, rank=8, target_mode="explicit")
             with patch.object(model.backbone, "gradient_checkpointing_enable", side_effect=modern_api):
                 self.assertEqual(model.gradient_checkpointing_enable(
                     gradient_checkpointing_kwargs={"use_reentrant": False}, every_n_layers=2, offload=True), "enabled")
@@ -430,7 +469,7 @@ class ModelTests(unittest.TestCase):
             base.save_pretrained(root / "base")
             backbone = get_peft_model(base, LoraConfig(r=2, lora_alpha=4, lora_dropout=0.05,
                 target_modules=["q_proj", "k_proj", "v_proj", "o_proj"], task_type="CAUSAL_LM"))
-            model = MemoryCausalLM(backbone, "tera", rank=8)
+            model = MemoryCausalLM(backbone, "tera", rank=8, target_mode="explicit")
             model.gradient_checkpointing_enable({"use_reentrant": False})
             model.train()
             loss = model(input_ids=self.ids, labels=torch.tensor([[-100]*8 + [13, 14, 15]]),
@@ -441,7 +480,8 @@ class ModelTests(unittest.TestCase):
             torch.optim.SGD([p for p in model.parameters() if p.requires_grad], lr=0.01).step()
             model.eval()
             backbone.save_pretrained(root / "lora")
-            restored = MemoryCausalLM(PeftModel.from_pretrained(Qwen2ForCausalLM.from_pretrained(root / "base"), root / "lora"), "tera", rank=8)
+            restored = MemoryCausalLM(PeftModel.from_pretrained(Qwen2ForCausalLM.from_pretrained(root / "base"), root / "lora"),
+                                      "tera", rank=8, target_mode="explicit")
             restored.adapter.load_state_dict(model.adapter.state_dict())
             restored.eval()
             with torch.no_grad():
@@ -458,6 +498,187 @@ class ModelTests(unittest.TestCase):
                     expected, _, _ = model.step(self.ids[:, 8:9], memory=mem, past=past)
                     torch.testing.assert_close(observed, expected, atol=1e-6, rtol=1e-5)
 
+
+@unittest.skipIf(torch is None, "CPU tensor checks need torch + transformers; stdlib checks still run")
+class LatentTargetTests(unittest.TestCase):
+    """TERA v2: the target is inferred from fact tokens; target_person never enters the input."""
+    def setUp(self):
+        from egc.tera_model import MemoryCausalLM
+        torch.set_num_threads(1)
+        torch.manual_seed(7)
+        self.base = Qwen2ForCausalLM(Qwen2Config(vocab_size=97, hidden_size=32, intermediate_size=48,
+            num_hidden_layers=2, num_attention_heads=4, num_key_value_heads=2, max_position_embeddings=128))
+        self.ids = torch.tensor([[5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]])
+        self.meta = {"prompt_length": 8, "sentences": [[1, 2, 3], [4, 5]], "charge": [0], "target": [],
+                     "target_mentions": [2, 4]}
+        self.labels = torch.tensor([[-100]*8 + [13, 14, 15]])
+        self.MemoryCausalLM = MemoryCausalLM
+
+    def test_pointer_supervision_reaches_pointer_only_with_aux_and_rejects_explicit_target(self):
+        for arm, supervised in (("tera", True), ("generic", True), ("tera_noaux", False)):
+            model = self.MemoryCausalLM(self.base, arm, rank=8)
+            model.zero_grad()
+            torch.nn.init.normal_(model.adapter.up.weight, std=.01)
+            out = model(input_ids=self.ids, labels=self.labels, meta=self.meta, role_labels=[0, 1])
+            self.assertIn("pointer", model.last_losses)
+            out["loss"].backward()
+            grad = model.adapter.target_score.weight.grad
+            self.assertGreater(grad.abs().sum().item(), 0)  # SFT alone also trains the pointer once up != 0
+            if supervised:
+                expected = model.last_losses["sft"] + .1 * model.last_losses["auxiliary"]
+                self.assertAlmostEqual(float(out["loss"]), expected, places=4)
+            else:
+                self.assertAlmostEqual(float(out["loss"]), model.last_losses["sft"], places=5)
+            with self.assertRaisesRegex(ValueError, "explicit target"):
+                model(input_ids=self.ids, labels=self.labels, meta=dict(self.meta, target=[6]), role_labels=[0, 1])
+            self.assertFalse(hasattr(model.adapter, "missing_target"))
+        model = self.MemoryCausalLM(self.base, "tera", rank=8).eval()
+        with torch.no_grad():
+            h = model.base.model(self.ids, use_cache=False).last_hidden_state[0]
+            memory = model.adapter.memory(h, self.meta)
+            self.assertAlmostEqual(float(memory["pointer"].sum()), 1.0, places=5)
+            self.assertEqual(len(memory["pointer"]), 5)
+            mass = float(memory["pointer"][[1, 3]].sum())
+            self.assertAlmostEqual(float(model.adapter.pointer_loss(memory, self.meta)), -math.log(mass), places=5)
+            self.assertIsNone(model.adapter.pointer_loss(memory, dict(self.meta, target_mentions=[])))
+            with self.assertRaisesRegex(ValueError, "outside fact memory"):
+                model.adapter.pointer_loss(memory, dict(self.meta, target_mentions=[7]))
+            # Zero-initialised residual still leaves the backbone unchanged in the inferred mode.
+            torch.testing.assert_close(model.adapter(h[7:], memory), h[7:], rtol=0, atol=0)
+
+    def test_inferred_cache_matches_full_recompute_and_budget_stays_matched(self):
+        from egc.tera_model import EvidenceAdapter
+        model = self.MemoryCausalLM(self.base, "tera", rank=8).eval()
+        torch.nn.init.normal_(model.adapter.up.weight, std=.1)
+        with torch.no_grad():
+            logits, state, past = model.step(self.ids[:, :8], meta=self.meta)
+            for pos in range(8, 11):
+                logits, state, past = model.step(self.ids[:, pos:pos+1], memory=state, past=past)
+                h = model.base.model(self.ids[:, :pos+1], use_cache=False).last_hidden_state[0]
+                expected = model.base.lm_head(model.adapter(h[-1:], model.adapter.memory(h, self.meta)))[0]
+                torch.testing.assert_close(logits, expected, atol=1e-5, rtol=1e-4)
+        sizes = [sum(p.numel() for p in EvidenceAdapter(3584, generic=g).parameters()) for g in (False, True)]
+        legacy = sum(p.numel() for p in EvidenceAdapter(3584, target_mode="explicit").parameters())
+        self.assertLess(sizes[0], 3_000_000)
+        self.assertLess(abs(sizes[1] / sizes[0] - 1), 0.05)
+        self.assertEqual(sizes[0] - legacy, 2 * 128 * 128 + 128 + 1 - 128)
+
+
+class ScriptedLM:
+    """Character LM with a fixed reply and a known month distribution; the cache is the token list."""
+    STOP = 3
+    REPLY = '{"reasoning": "x", "sentence_months": '
+    NUMBERS = {"": {"1": .40, "2": .35, "3": .25}, "1": {"2": .6, "}": .4}, "12": {"}": 1.},
+               "2": {"4": .9, "}": .1}, "24": {"0": .6, "}": .4}, "240": {"}": 1.}, "3": {"6": 1.}, "36": {"}": 1.}}
+
+    class Past:
+        def __init__(self):
+            self.tokens = []
+        def get_seq_length(self):
+            return len(self.tokens)
+        def crop(self, n):
+            if n >= 0:
+                raise AssertionError("rollback must use negative crop")
+            del self.tokens[n:]
+
+    def __init__(self, prompt_length):
+        self.prompt_length = prompt_length
+
+    def step(self, tokens, meta=None, memory=None, past=None):
+        past = past or self.Past()
+        past.tokens.extend(tokens[0].tolist())
+        text = "".join(map(chr, past.tokens[self.prompt_length:]))
+        if text.endswith("}"):
+            probabilities = {self.STOP: 1.}
+        elif text.startswith(self.REPLY):
+            probabilities = {ord(k): v for k, v in self.NUMBERS[text[len(self.REPLY):]].items()}
+        else:
+            probabilities = {ord(self.REPLY[len(text)]): 1.}
+        logits = torch.full((128,), -30.)
+        for token, value in probabilities.items():
+            logits[token] = math.log(value)
+        return logits, None, past
+
+
+class DecodeTokenizer(CharacterTokenizer):
+    def decode(self, ids, skip_special_tokens=False):
+        return "".join(chr(i) for i in ids if not (skip_special_tokens and i == ScriptedLM.STOP))
+
+
+@unittest.skipIf(torch is None, "CPU tensor checks need torch")
+class NumberDecodingTests(unittest.TestCase):
+    def test_median_greedy_record_close_and_cache_rollback(self):
+        from egc.tera_server import digit_tokens, generate, greedy_view
+        tokenizer = DecodeTokenizer()
+        digits = digit_tokens(tokenizer)
+        prompt = [ord(c) for c in "prompt"]
+        plain, finish, _, number = generate(ScriptedLM(len(prompt)), tokenizer, prompt, {}, {ScriptedLM.STOP}, device="cpu")
+        self.assertIsNone(number)
+        self.assertEqual(tokenizer.decode(plain, True), ScriptedLM.REPLY + "12}")  # greedy collapses to 12
+        generated, finish, _, number = generate(ScriptedLM(len(prompt)), tokenizer, prompt, {}, {ScriptedLM.STOP},
+                                                digits, device="cpu")
+        text = tokenizer.decode(generated, True)
+        # Numbers: 1 .16, 2 .035, 12 .24, 24 .126, 36 .25, 240 .189 -> median 24, greedy 12.
+        self.assertEqual(finish, "stop")
+        self.assertEqual(text, ScriptedLM.REPLY + "24}")  # the digit after the chosen number is blocked, not 240
+        self.assertEqual((number["mbr_months"], number["greedy_months"]), (24, 12))
+        self.assertAlmostEqual(number["mean_months"], .16*1 + .035*2 + .24*12 + .126*24 + .25*36 + .189*240, places=4)
+        self.assertAlmostEqual(number["kept_mass"], 1.0, places=6)
+        self.assertTrue(number["record_matches_text"])
+        self.assertEqual(number["char_start"], len(ScriptedLM.REPLY))
+        row = {"id": "x", "text": text, "finish_reason": finish, "number_decoding": number}
+        self.assertEqual(greedy_view([row])[0]["text"], ScriptedLM.REPLY + "12}")
+        with self.assertRaisesRegex(ValueError, "does not match"):
+            greedy_view([dict(row, text=ScriptedLM.REPLY + "36}")])
+
+    def test_trie_matches_bruteforce_probabilities_on_real_cache(self):
+        from egc.tera_model import MemoryCausalLM
+        from egc.tera_server import number_mbr
+        torch.manual_seed(3)
+        base = Qwen2ForCausalLM(Qwen2Config(vocab_size=97, hidden_size=32, intermediate_size=48,
+            num_hidden_layers=2, num_attention_heads=4, num_key_value_heads=2, max_position_embeddings=128))
+        cases = (("direct", None), ("tera", {"prompt_length": 6, "sentences": [[1, 2], [3]], "charge": [0], "target": []}))
+        for arm, meta in cases:
+            model = MemoryCausalLM(base, arm, rank=8).eval()
+            if model.adapter is not None:
+                torch.nn.init.normal_(model.adapter.up.weight, std=.5)
+            digits = list(range(48, 58))
+            prefix = torch.tensor([[5, 6, 7, 8, 9, 10]])
+            with torch.no_grad():
+                logits, memory, past = model.step(prefix, meta=meta)
+                root = logits.clone()
+                root[digits[2]] = root.max() + 1  # force a greedy digit at the slot
+                result = number_mbr(model, root, memory, past, digits, threshold=0.0, max_digits=2)
+                self.assertEqual(past.get_seq_length(), 6)
+                after, _, _ = model.step(torch.tensor([[11]]), memory=memory, past=past)
+                _, fresh_memory, fresh_past = model.step(prefix, meta=meta)
+                expected_after, _, _ = model.step(torch.tensor([[11]]), memory=fresh_memory, past=fresh_past)
+                torch.testing.assert_close(after, expected_after, atol=1e-5, rtol=1e-4)
+                # Brute force with fresh caches: P(n) for every n < 100 under the same root renormalisation.
+                p0 = root.softmax(-1)[digits].double()
+                p0 = p0 / p0.sum()
+                exact, greedy = {0: float(p0[0])}, None
+                for d in range(1, 10):
+                    _, m, pk = model.step(prefix, meta=meta)
+                    nested, _, _ = model.step(torch.tensor([[digits[d]]]), memory=m, past=pk)
+                    q = nested.softmax(-1)[digits].double()
+                    exact[d] = float(p0[d] * (1 - q.sum()))
+                    for e in range(10):
+                        exact[10 * d + e] = float(p0[d] * q[e])
+                    if d == 2:
+                        top = int(nested.argmax())
+                        greedy = 20 + digits.index(top) if top in digits else 2
+                ordered, cumulative = sorted(exact.items()), 0.0
+                for value, share in ordered:
+                    cumulative += share
+                    if cumulative >= .5:
+                        median = value
+                        break
+                self.assertEqual(result["mbr_months"], median)
+                self.assertEqual(result["greedy_months"], greedy)
+                self.assertAlmostEqual(result["kept_mass"], 1.0, places=5)
+                self.assertAlmostEqual(result["mean_months"], sum(v * w for v, w in ordered), places=4)
+                self.assertEqual(result["pruned_mass"], 0.0)
 
 if __name__ == "__main__":
     unittest.main()

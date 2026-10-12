@@ -96,7 +96,7 @@ def render_chat(tokenizer, messages):
     return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True, enable_thinking=False)
 
 
-def tokenize_sft_row(tokenizer, row, chat_protocol):
+def tokenize_sft_row(tokenizer, row, chat_protocol, include_offsets=False):
     """Render on the server before TRL; preserve the exact inference prefix and loss mask."""
     prompt = render_chat(tokenizer, row["prompt"])
     conversation = tokenizer.apply_chat_template(row["prompt"] + row["completion"],
@@ -115,9 +115,18 @@ def tokenize_sft_row(tokenizer, row, chat_protocol):
     if not prompt_ids or input_ids[:len(prompt_ids)] != prompt_ids or len(input_ids) <= len(prompt_ids):
         raise ValueError(f"Invalid prompt/completion token boundary: {row['id']}")
     mask = [0] * len(prompt_ids) + [1] * (len(input_ids) - len(prompt_ids))
-    return {"input_ids": input_ids, "attention_mask": [1] * len(input_ids),
+    result = {"input_ids": input_ids, "attention_mask": [1] * len(input_ids),
             "completion_mask": mask,
             "labels": [token if supervised else -100 for token, supervised in zip(input_ids, mask)]}
+    if include_offsets:
+        answer = row["completion"][0]["content"]
+        if len(row["completion"]) != 1 or not conversation[len(prompt):].startswith(answer):
+            raise ValueError("Cannot align assistant answer to the rendered conversation")
+        encoded = tokenizer(conversation, add_special_tokens=False, return_offsets_mapping=True)
+        if encoded["input_ids"] != input_ids or len(encoded["offset_mapping"]) != len(input_ids):
+            raise ValueError("Training offset/token mismatch")
+        result.update(offset_mapping=encoded["offset_mapping"], completion_char_start=len(prompt))
+    return result
 
 
 def check_training_rows(train_rows, dev_rows):

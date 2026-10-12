@@ -42,6 +42,8 @@ def unpack(archive, output):
         allowed |= {f"{a}.dev.jobs.jsonl" for a in ARMS}
         allowed |= {f"{t['name']}.references.jsonl" for t in tests}
         allowed |= {f"{a}.{t['name']}.jobs.jsonl" for a in ARMS for t in tests}
+        if "training_correction" in manifest:
+            allowed |= {"train.target_supervision.jsonl", "dev.target_supervision.jsonl"}
         if set(names) != allowed | {"checksums.json"}:
             raise ValueError("Unexpected package members")
         data = {n: bundle.read(n) for n in allowed}
@@ -58,7 +60,18 @@ def validate_data(data):
     from .server import check_training_rows
     data = Path(data)
     manifest = read_json(data / "manifest.json")
+    from .correct_training import sentence_policy
+    sentence_policy(manifest)
     refs = {s: read_rows(data / f"{s}.references.jsonl") for s in ("train", "dev")}
+    if "training_correction" in manifest:
+        if any("target_person" in r for records in refs.values() for r in records):
+            raise ValueError("Corrected training/dev must not expose target_person")
+        for split, records in refs.items():
+            mentions = read_rows(data / f"{split}.target_supervision.jsonl")
+            if [m["id"] for m in mentions] != [r["id"] for r in records] or any(
+                    set(m) != {"id", "target_char_spans"} or any(not 0 <= a < b <= len(r["facts"]) for a, b in m["target_char_spans"])
+                    for m, r in zip(mentions, records)):
+                raise ValueError("Target-mention sidecar does not match label-side cases")
     for arm in ARMS:
         sft = {s: read_rows(data / f"{arm}.{s}.sft.jsonl") for s in refs}
         check_training_rows(sft["train"], sft["dev"])
@@ -266,6 +279,8 @@ def run(archive, output, model=DEFAULT_MODEL, seed=42, epochs=3, max_length=8192
     out = Path(output).resolve() if resume else fresh(output).resolve()
     model = str(Path(model).resolve())
     manifest = validate_data(out / "data") if resume else unpack(archive, out / "data")
+    if "training_correction" in manifest:
+        raise ValueError("Corrected packages require egc.tera_server so the declared training loss is honored")
     data = out / "data"
     commit = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True)
     identity = {"version": VERSION, "git_commit": commit.stdout.strip() if commit.returncode == 0 else None,

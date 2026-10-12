@@ -7,13 +7,22 @@ from torch.nn import functional as F
 
 
 class EvidenceAdapter(nn.Module):
-    def __init__(self, hidden_size, rank=128, generic=False):
+    """target_mode="inferred" (v2) points at the target inside the facts; "explicit" is the v1 field reader."""
+    def __init__(self, hidden_size, rank=128, generic=False, target_mode="inferred"):
         super().__init__()
-        self.rank, self.generic = rank, generic
+        if target_mode not in ("inferred", "explicit"):
+            raise ValueError("Unknown target mode")
+        self.rank, self.generic, self.target_mode = rank, generic, target_mode
         self.norm = nn.LayerNorm(hidden_size)
         self.down = nn.Linear(hidden_size, rank, bias=False)
         self.condition = nn.Linear(2 * rank, rank, bias=False)
-        self.missing_target = nn.Parameter(torch.zeros(rank))
+        if target_mode == "explicit":
+            self.missing_target = nn.Parameter(torch.zeros(rank))
+        else:
+            # Charge-conditioned pointer over fact tokens; generic shares it so only routing differs.
+            self.target_e = nn.Linear(rank, rank, bias=False)
+            self.target_c = nn.Linear(rank, rank, bias=False)
+            self.target_score = nn.Linear(rank, 1)
         self.role_e = nn.Linear(rank, rank, bias=False)
         self.role_q = nn.Linear(rank, rank, bias=False)
         self.role = nn.Linear(rank, 3)
@@ -38,10 +47,34 @@ class EvidenceAdapter(nn.Module):
             return hidden[indices].mean(0)
         e = self.project(torch.stack([pool(s) for s in meta["sentences"]]))
         charge = self.project(pool(meta["charge"]))
-        target = self.project(pool(meta["target"])) if meta["target"] else self.missing_target
+        extra = {}
+        if self.target_mode == "explicit":
+            target = self.project(pool(meta["target"])) if meta["target"] else self.missing_target
+        else:
+            if meta["target"]:
+                raise ValueError("Latent-target TERA never reads an explicit target field")
+            facts = sorted({i for s in meta["sentences"] for i in s})
+            z = self.project(hidden[facts])
+            scores = self.target_score(torch.tanh(self.target_e(z) + self.target_c(charge))).squeeze(-1)
+            pointer = scores.float().softmax(0)
+            target = (pointer[:, None] * z.float()).sum(0).to(z.dtype)
+            extra["pointer"] = pointer
         q = self.condition(torch.cat((target, charge)))
         role_logits = self.role(torch.tanh(self.role_e(e) + self.role_q(q)))
-        return {"q": q, "roles": role_logits, "key": self.key(e), "value": self.value(e)}
+        return {"q": q, "roles": role_logits, "key": self.key(e), "value": self.value(e)} | extra
+
+    @staticmethod
+    def pointer_loss(memory, meta):
+        """-log pointer mass on literal target mentions; None when unsupervised."""
+        mentions = meta.get("target_mentions")
+        if "pointer" not in memory or not mentions:
+            return None
+        facts = sorted({i for s in meta["sentences"] for i in s})
+        index = {position: k for k, position in enumerate(facts)}
+        if any(m not in index for m in mentions):
+            raise ValueError("Target mention outside fact memory")
+        mass = memory["pointer"][[index[m] for m in mentions]].sum()
+        return -mass.clamp_min(1e-8).log()
 
     def forward(self, hidden, memory):
         z, q = self.project(hidden), memory["q"]
@@ -68,13 +101,13 @@ class EvidenceAdapter(nn.Module):
 
 class MemoryCausalLM(nn.Module):
     """Batch size one by design; batching would need independent span/caching metadata."""
-    def __init__(self, backbone, arm, rank=128):
+    def __init__(self, backbone, arm, rank=128, target_mode="inferred"):
         super().__init__()
         if arm not in ("direct", "generic", "tera_noaux", "tera"):
             raise ValueError("Unknown module arm")
         self.backbone, self.arm = backbone, arm
         self.config = self.base.config
-        self.adapter = None if arm == "direct" else EvidenceAdapter(self.config.hidden_size, rank, arm == "generic")
+        self.adapter = None if arm == "direct" else EvidenceAdapter(self.config.hidden_size, rank, arm == "generic", target_mode)
         self.aux_weight = 0.1 if arm in ("generic", "tera") else 0.0
         self.last_losses = {}
 
@@ -87,7 +120,7 @@ class MemoryCausalLM(nn.Module):
         return self.backbone.gradient_checkpointing_enable(
             gradient_checkpointing_kwargs=gradient_checkpointing_kwargs, **kwargs)
 
-    def forward(self, input_ids, labels, meta, role_labels):
+    def forward(self, input_ids, labels, meta, role_labels, sentence_mask=None):
         if input_ids.shape[0] != 1 or input_ids.shape != labels.shape:
             raise ValueError("TERA v1 requires unpadded batch size one")
         p = meta["prompt_length"]
@@ -97,6 +130,7 @@ class MemoryCausalLM(nn.Module):
         # Shift once: position P-1 predicts first assistant token; no earlier update.
         predicted = hidden[p-1:-1]
         auxiliary = hidden.new_zeros((), dtype=torch.float32)
+        pointer_loss = None
         if self.adapter is not None:
             memory = self.adapter.memory(hidden, meta)
             predicted = self.adapter(predicted, memory)
@@ -105,13 +139,32 @@ class MemoryCausalLM(nn.Module):
                 raise ValueError("Invalid auxiliary labels")
             if (roles != -100).any():
                 auxiliary = F.cross_entropy(memory["roles"].float(), roles, ignore_index=-100)
+            pointer_loss = self.adapter.pointer_loss(memory, meta)
+            if pointer_loss is not None:
+                auxiliary = auxiliary + pointer_loss
         # Only completion logits are needed, avoiding a full prompt x vocabulary tensor.
         logits = self.base.lm_head(predicted)
-        sft = F.cross_entropy(logits.float(), labels[0, p:])
+        if sentence_mask is None:
+            sft = F.cross_entropy(logits.float(), labels[0, p:])
+            sentence_loss = rest_loss = None
+        else:
+            mask = torch.as_tensor(sentence_mask, device=labels.device)
+            if mask.dtype != torch.bool or mask.shape != labels.shape or mask[0, :p].any():
+                raise ValueError("Invalid sentence loss mask")
+            mask = mask[0, p:]
+            if not mask.any() or mask.all():
+                raise ValueError("Sentence and remaining completion both need supervised tokens")
+            per_token = F.cross_entropy(logits.float(), labels[0, p:], reduction="none")
+            sentence_loss, rest_loss = per_token[mask].mean(), per_token[~mask].mean()
+            sft = .5 * sentence_loss + .5 * rest_loss
         loss = sft + self.aux_weight * auxiliary
         if not torch.isfinite(loss):
             raise ValueError("Non-finite training loss")
-        self.last_losses = {"sft": float(sft.detach()), "role": float(auxiliary.detach())}
+        self.last_losses = {"sft": float(sft.detach()), "auxiliary": float(auxiliary.detach())}
+        if pointer_loss is not None:
+            self.last_losses["pointer"] = float(pointer_loss.detach())
+        if sentence_loss is not None:
+            self.last_losses.update(sentence=float(sentence_loss.detach()), rest=float(rest_loss.detach()))
         return {"loss": loss}
 
     def step(self, input_ids, meta=None, memory=None, past=None, return_base_logits=False):

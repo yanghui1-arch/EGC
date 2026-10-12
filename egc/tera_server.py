@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import platform
+import re
 import subprocess
 import sys
 import time
@@ -16,9 +17,13 @@ from .learned import fresh
 from .learned_server import DEFAULT_MODEL, check_prediction_identity, collect, execute, unpack
 from .qwen_eos_smoke import select_jobs
 from .server import SFT_TOKENIZATION_VERSION, configure_chat, environment, select_training_mode
-from .tera_data import VERSION, prompt_features, training_rows
+from .tera_data import VERSION, prompt_features, target_mode, training_rows
+from .correct_training import BALANCED, TOKEN_MEAN, sentence_policy
 
 ARMS = ("direct", "generic", "tera_noaux", "tera")
+DECODINGS = ("greedy", "mbr")
+MBR = {"version": "number-median-mbr-v1", "threshold": 1e-3, "max_digits": 3}
+MONTH_KEY = re.compile(r'"sentence_months"\s*:\s*$')
 
 
 def file_hash(path):
@@ -54,8 +59,13 @@ def tokenizer_for(model):
 def prepare(data, model, max_length):
     """Called by the user's server process; reuses private, already transferred data."""
     tokenizer, protocol = tokenizer_for(model)
+    manifest = read_json(data / "manifest.json")
+    if "training_correction" not in manifest:
+        raise ValueError("TERA v2 trains only on the implicit-target package (python -m egc.correct_training)")
+    loss_policy = sentence_policy(manifest)
+    targets = {m["id"]: m["target_char_spans"] for m in read_rows(data / "train.target_supervision.jsonl")}
     rows, report = training_rows(tokenizer, protocol, read_rows(data / "direct.train.sft.jsonl"),
-                                 read_rows(data / "bound.train.sft.jsonl"), max_length)
+                                 read_rows(data / "bound.train.sft.jsonl"), max_length, loss_policy == BALANCED, targets)
     jobs = read_rows(data / "direct.dev.jobs.jsonl")
     for job in jobs:
         ids, _, _ = prompt_features(tokenizer, job["messages"])
@@ -66,6 +76,11 @@ def prepare(data, model, max_length):
     report.update({"chat_protocol": protocol, "tokenization_version": SFT_TOKENIZATION_VERSION,
                    "training_hash": digest(rows), "dev_jobs_hash": digest(jobs), "max_length": max_length,
                    "new_api_calls": 0, "all_arms_same_sft_tokens": True})
+    if any(r["meta"]["target"] for r in rows) or any("target_person" in json.loads(j["messages"][-1]["content"]) for j in jobs):
+        raise ValueError("Corrected train/dev input unexpectedly contains target_person")
+    report.update(training_correction=manifest["training_correction"], sentence_loss=loss_policy,
+                  sentence_number_tokens=sum(sum(r.get("sentence_mask", [])) for r in rows),
+                  target_mention_tokens=sum(len(r["meta"]["target_mentions"]) for r in rows))
     print("Auxiliary alignment (not semantic accuracy):", json.dumps(report["alignment"]), flush=True)
     if any(report["alignment"].get(role, 0) == 0 for role in ("target", "other", "uncertain")):
         print("WARNING: at least one role has no aligned labels; this run cannot establish the full attribution mechanism", flush=True)
@@ -77,7 +92,8 @@ def load_model(model, arm, artifact=None):
     import torch
     from transformers import AutoModelForCausalLM
     from .tera_model import MemoryCausalLM
-    full_reload = artifact and read_json(artifact / "module.json")["training_mode"] == "full"
+    saved = read_json(artifact / "module.json") if artifact else {"version": VERSION}
+    full_reload = artifact and saved["training_mode"] == "full"
     backbone = AutoModelForCausalLM.from_pretrained(model, local_files_only=True, trust_remote_code=False,
         torch_dtype=torch.float32 if full_reload else torch.bfloat16, attn_implementation="sdpa")
     total = backbone.num_parameters()
@@ -93,7 +109,7 @@ def load_model(model, arm, artifact=None):
         backbone.float().requires_grad_(True)
     elif Path(model).resolve() != (artifact / "backbone").resolve():
         raise ValueError("Full-SFT inference must load the exported backbone")
-    wrapped = MemoryCausalLM(backbone, arm)
+    wrapped = MemoryCausalLM(backbone, arm, target_mode=target_mode(saved["version"]))
     if artifact and wrapped.adapter is not None:
         wrapped.adapter.load_state_dict(torch.load(artifact / "memory.pt", map_location="cpu", weights_only=True), strict=True)
     return wrapped.cuda(), total, mode
@@ -104,8 +120,11 @@ def collate(rows):
     if len(rows) != 1:
         raise ValueError("TERA v1 uses batch size one, with gradient accumulation")
     row = rows[0]
-    return {"input_ids": torch.tensor([row["input_ids"]]), "labels": torch.tensor([row["labels"]]),
-            "meta": row["meta"], "role_labels": row["role_labels"]}
+    batch = {"input_ids": torch.tensor([row["input_ids"]]), "labels": torch.tensor([row["labels"]]),
+             "meta": row["meta"], "role_labels": row["role_labels"]}
+    if "sentence_mask" in row:
+        batch["sentence_mask"] = torch.tensor([row["sentence_mask"]], dtype=torch.bool)
+    return batch
 
 
 def cache_probe(model, ids, meta, steps=1, precision="bf16"):
@@ -224,6 +243,10 @@ def train(data, output, model, arm, seed, epochs, max_steps, max_length):
     tokenizer, protocol = tokenizer_for(model)
     rows = read_rows(data / "tera.train.jsonl")
     budget = read_json(data.parent / "token_budget.json")
+    loss_policy = sentence_policy(read_json(data / "manifest.json"))
+    if (budget.get("sentence_loss", TOKEN_MEAN) != loss_policy
+            or any(("sentence_mask" in r) != (loss_policy == BALANCED) for r in rows)):
+        raise ValueError("Prepared sentence supervision does not match the package policy")
     if digest(rows) != budget["training_hash"] or protocol != budget["chat_protocol"] or max_length != budget["max_length"]:
         raise ValueError("Prepared data/protocol changed")
     if any(len(r["input_ids"]) > max_length for r in rows):
@@ -233,7 +256,7 @@ def train(data, output, model, arm, seed, epochs, max_steps, max_length):
     if network.config.max_position_embeddings < max_length:
         raise ValueError("Requested context exceeds checkpoint configuration")
     network.base.config.use_cache = False
-    sizes = {name: sum(p.numel() for p in EvidenceAdapter(network.config.hidden_size, generic=generic).parameters())
+    sizes = {name: sum(p.numel() for p in EvidenceAdapter(network.config.hidden_size, generic=generic, target_mode="inferred").parameters())
              for name, generic in (("tera", False), ("generic", True))}
     if sizes["tera"] >= 3_000_000 or abs(sizes["generic"] / sizes["tera"] - 1) > 0.05:
         raise ValueError("Module parameter budget/control match failed")
@@ -246,6 +269,8 @@ def train(data, output, model, arm, seed, epochs, max_steps, max_length):
                 "batch_size": 1, "grad_accum": 16, "checkpoint_selection": "final",
                 "environment": environment(root=model, gpu=True),
                 "cuda_visible_devices": os.environ["CUDA_VISIBLE_DEVICES"]}
+    manifest.update(training_correction=budget["training_correction"], sentence_loss=loss_policy,
+                    target_mode="inferred", pointer_supervision="tera/generic aux only")
     write_json(out / "run_manifest.json", manifest)
     print(json.dumps(manifest, ensure_ascii=False), flush=True)
     gradient_checks = {}
@@ -318,10 +343,133 @@ def frozen_jobs(data, split):
     return jobs
 
 
-def infer(data, trained, output, model, seed, max_length, smoke=False, validate_only=False, split="dev"):
+def digit_tokens(tokenizer):
+    ids = [tokenizer.encode(str(d), add_special_tokens=False) for d in range(10)]
+    if any(len(x) != 1 for x in ids) or len({x[0] for x in ids}) != 10:
+        raise ValueError("Number MBR needs single-token digits")
+    return [x[0] for x in ids]
+
+
+def rollback(past, length):
+    # Negative crop removes tokens in Transformers 4.x and 5.x alike.
+    extra = past.get_seq_length() - length
+    if extra > 0:
+        past.crop(-extra)
+    if past.get_seq_length() != length:
+        raise ValueError("Cache rollback failed")
+
+
+def number_mbr(network, logits, memory, past, digits, threshold=MBR["threshold"], max_digits=MBR["max_digits"]):
+    """Digit-trie distribution over whole month numbers at the sentence_months slot.
+
+    Greedy digit decoding returns the mode of the first digit's aggregated mass (1x/3x),
+    not of the number; the median of the number distribution minimises expected absolute error.
+    The greedy number follows argmax tokens on the same trie, reproducing plain greedy decoding."""
+    import torch
+    base = past.get_seq_length()
+    position = {token: d for d, token in enumerate(digits)}
+    mass, stats = {}, {"expansions": 0, "pruned_mass": 0.0}
+    greedy = [None]
+
+    def visit(prefix, weight, scores, on_greedy):
+        p = scores.float().softmax(-1)
+        child = p[digits].double()
+        top = int(scores.argmax())
+        if not prefix:
+            stats["root_non_digit_mass"] = float(1 - child.sum())
+            child = child / child.sum()
+        elif prefix == "0" or len(prefix) == max_digits:
+            mass[prefix] = mass.get(prefix, 0.0) + weight
+            if on_greedy:
+                greedy[0] = prefix
+            return
+        else:
+            mass[prefix] = mass.get(prefix, 0.0) + weight * float(1 - child.sum())
+            child = child.clone()
+        continue_greedy = on_greedy and top in position
+        if on_greedy and not continue_greedy:
+            greedy[0] = prefix
+        for d in range(10):
+            share = weight * float(child[d])
+            follow = continue_greedy and position[top] == d
+            if share < threshold and not follow:
+                stats["pruned_mass"] += share
+                continue
+            stats["expansions"] += 1
+            nested, _, _ = network.step(torch.tensor([[digits[d]]], device=scores.device), memory=memory, past=past)
+            visit(prefix + str(d), share, nested, follow)
+            rollback(past, base + len(prefix))
+
+    if int(logits.argmax()) not in position:
+        raise ValueError("Number MBR triggered without a greedy digit")
+    visit("", 1.0, logits, True)
+    total = sum(mass.values())
+    ordered = sorted((int(k), v / total) for k, v in mass.items())
+    cumulative, median = 0.0, None
+    for value, share in ordered:
+        cumulative += share
+        if cumulative >= 0.5:
+            median = value
+            break
+    return {"version": MBR["version"], "mbr_months": median, "greedy_months": int(greedy[0]),
+            "mean_months": sum(v * w for v, w in ordered), "kept_mass": total,
+            "top": sorted(([v, w] for v, w in ordered), key=lambda x: -x[1])[:8], **stats}
+
+
+def generate(network, tokenizer, ids, meta, stops, digits=None, max_new_tokens=2048, device="cuda"):
+    """Greedy request-local decoding; with digits, the sentence_months number is chosen by number_mbr."""
+    import torch
+    memory = past = None
+    tokens = torch.tensor([ids], device=device)
+    generated, finish = [], "length"
+    routing = number = None
+    close_number = False
+    while len(generated) < max_new_tokens:
+        logits, memory, past = network.step(tokens, meta=meta, memory=memory, past=past)
+        if routing is None and memory is not None:
+            probabilities = memory["roles"].float().softmax(-1)
+            routing = {"predicted_role_mean": probabilities.mean(0).tolist(),
+                "role_entropy_mean": float(-(probabilities * probabilities.clamp_min(1e-8).log()).sum(-1).mean()),
+                "sentences": len(probabilities), "semantic_accuracy": None}
+            if "pointer" in memory:
+                facts = sorted({i for span in meta["sentences"] for i in span})
+                top = memory["pointer"].topk(min(8, len(facts))).indices.tolist()
+                routing["pointer_top_text"] = [tokenizer.decode([ids[facts[k]]]) for k in top]
+                routing["pointer_max"] = float(memory["pointer"].max())
+                loss = network.adapter.pointer_loss(memory, meta)
+                routing["pointer_target_mass"] = None if loss is None else float((-loss).exp())
+        if close_number:
+            # The trie already priced "number ends here"; another digit would change the value.
+            logits = logits.clone()
+            logits[digits] = float("-inf")
+            close_number = False
+        token = int(logits.argmax())
+        if (digits and number is None and token in digits and len(generated) + MBR["max_digits"] <= max_new_tokens
+                and MONTH_KEY.search(tokenizer.decode(generated[-32:], skip_special_tokens=True))):
+            number = number_mbr(network, logits, memory, past, digits)
+            number["char_start"] = len(tokenizer.decode(generated, skip_special_tokens=True))
+            chosen = [digits[int(c)] for c in str(number["mbr_months"])]
+            generated.extend(chosen)
+            tokens = torch.tensor([chosen], device=device)
+            close_number = True
+            continue
+        generated.append(token)
+        if token in stops:
+            finish = "stop"
+            break
+        tokens = torch.tensor([[token]], device=device)
+    if number is not None:
+        written = re.match(r"\d+", tokenizer.decode(generated, skip_special_tokens=True)[number["char_start"]:])
+        number["record_matches_text"] = bool(written) and written.group() == str(number["mbr_months"])
+    return generated, finish, routing, number
+
+
+def infer(data, trained, output, model, seed, max_length, smoke=False, validate_only=False, split="dev", decoding="greedy"):
     require_server()
     import torch
     from transformers import set_seed
+    if decoding not in DECODINGS:
+        raise ValueError("Unknown decoding")
     trained, data, output = Path(trained), Path(data), Path(output)
     if not validate_only and (output.exists() or Path(str(output) + ".manifest.json").exists()):
         raise ValueError("Refusing to overwrite predictions")
@@ -335,13 +483,17 @@ def infer(data, trained, output, model, seed, max_length, smoke=False, validate_
     if actual != done["artifact_sha256"]:
         raise ValueError("Missing/changed backbone or module artifact")
     manifest = read_json(artifact / "module.json")
-    if manifest["version"] != VERSION or manifest["model"] != str(Path(model).resolve()):
+    mode = target_mode(manifest["version"])  # legacy v1 artifacts stay loadable for re-decoding
+    if manifest["model"] != str(Path(model).resolve()):
         raise ValueError("Wrong module version/base model")
     tokenizer, protocol = tokenizer_for(model)
     if protocol != manifest["chat_protocol"]:
         raise ValueError("Changed tokenization protocol")
+    digits = digit_tokens(tokenizer) if decoding == "mbr" else None
     dev_jobs = read_rows(data / "direct.dev.jobs.jsonl")
     budget = read_json(data.parent / "token_budget.json")
+    if manifest.get("sentence_loss", TOKEN_MEAN) != budget.get("sentence_loss", TOKEN_MEAN):
+        raise ValueError("Inference artifact and prepared training loss differ")
     if (digest(dev_jobs) != budget["dev_jobs_hash"] or manifest["training_hash"] != budget["training_hash"]
             or manifest["seed"] != seed or manifest["max_length"] != (max_length if split == "dev" else budget["max_length"])):
         raise ValueError("Changed inference experiment identity")
@@ -370,12 +522,14 @@ def infer(data, trained, output, model, seed, max_length, smoke=False, validate_
     original = done["cache_probe"]
     if probe["first_top_ids"] != original["first_top_ids"] or max(abs(a-b) for a, b in zip(probe["first_top_logits"], original["first_top_logits"])) > 0.01:
         raise ValueError("Save/reload logits changed")
-    settings = {"version": VERSION, "arm": manifest["arm"], "model": str(Path(model).resolve()),
+    settings = {"version": manifest["version"], "arm": manifest["arm"], "model": str(Path(model).resolve()),
                 "artifact_hash": digest(actual), "jobs_hash": digest(jobs), "training_hash": manifest["training_hash"],
                 "backend": "transformers_request_local_cache", "seed": seed, "temperature": 0,
                 "max_new_tokens": 2048, "max_model_len": max_length, "dtype": "bfloat16", "chat_protocol": protocol}
     if split != "dev":
         settings["split"] = split
+    if decoding == "mbr":
+        settings["number_decoding"] = MBR  # greedy settings stay byte-identical to earlier runs
     key = digest(settings)
     sidecar = {"settings": settings, "generation_key": key, "save_reload_probe": probe}
     if validate_only:
@@ -387,6 +541,10 @@ def infer(data, trained, output, model, seed, max_length, smoke=False, validate_
         print("Revalidated saved weights and reused predictions:", output, flush=True)
         return
     write_json(str(output) + ".manifest.json", sidecar)
+    # Label-side dev mentions only score the pointer after generation inputs are fixed.
+    supervision = data / "dev.target_supervision.jsonl"
+    mentions = ({m["id"]: m["target_char_spans"] for m in read_rows(supervision)}
+                if split == "dev" and mode == "inferred" and supervision.exists() else {})
     eos = network.config.eos_token_id
     stops = set(eos if isinstance(eos, list) else [eos]) | set(protocol["stop_token_ids"])
     predictions = []
@@ -394,61 +552,83 @@ def infer(data, trained, output, model, seed, max_length, smoke=False, validate_
         for index, job in enumerate(jobs, 1):
             if job["prompt_hash"] != digest(job["messages"]) or job["split"] != ("dev" if split == "dev" else "test"):
                 raise ValueError("Changed prompt or unfrozen split")
-            ids, meta, _ = prompt_features(tokenizer, job["messages"])
+            ids, meta, _ = prompt_features(tokenizer, job["messages"], mentions.get(job["id"]))
             if len(ids) + 2048 > max_length:
                 raise ValueError("Overlength generation; no truncation")
-            memory = past = None
-            tokens = torch.tensor([ids], device="cuda")
-            generated, finish = [], "length"
-            routing = None
             started = time.time()
-            for _ in range(2048):
-                logits, memory, past = network.step(tokens, meta=meta, memory=memory, past=past)
-                if routing is None and memory is not None:
-                    probabilities = memory["roles"].float().softmax(-1)
-                    routing = {"predicted_role_mean": probabilities.mean(0).tolist(),
-                        "role_entropy_mean": float(-(probabilities * probabilities.clamp_min(1e-8).log()).sum(-1).mean()),
-                        "sentences": len(probabilities), "semantic_accuracy": None}
-                token = int(logits.argmax())
-                generated.append(token)
-                if token in stops:
-                    finish = "stop"
-                    break
-                tokens = torch.tensor([[token]], device="cuda")
+            generated, finish, routing, number = generate(network, tokenizer, ids, meta, stops, digits)
             row = {"id": job["id"], "prompt_hash": job["prompt_hash"], "generation_key": key,
                    "text": tokenizer.decode(generated, skip_special_tokens=True), "finish_reason": finish,
                    "generated_tokens": len(generated), "prompt_tokens": len(ids), "seconds": time.time()-started}
             if routing is not None:
                 row["routing_diagnostic"] = routing
+            if number is not None:
+                row["number_decoding"] = number
             handle.write(json.dumps(row, ensure_ascii=False) + "\n")
             handle.flush()
             predictions.append(row)
-            del memory, past
             print(f"{manifest['arm']}: {split} {index}/{len(jobs)}, tokens={len(generated)}, finish={finish}", flush=True)
     check_prediction_identity(jobs, predictions, sidecar)
+
+
+def greedy_view(predictions):
+    """Same generation with the recorded plain-greedy number; reasoning text is shared up to that slot."""
+    rows = []
+    for p in predictions:
+        number = p.get("number_decoding")
+        if number is None:
+            rows.append(p)
+            continue
+        start, written = number["char_start"], str(number["mbr_months"])
+        if not number.get("record_matches_text") or p["text"][start:start + len(written)] != written:
+            raise ValueError("Number record does not match prediction text")
+        rows.append(dict(p, text=p["text"][:start] + str(number["greedy_months"]) + p["text"][start + len(written):]))
+    return rows
+
+
+def score(refs, predictions):
+    metrics, comparisons = {}, {}
+    for arm, rows in predictions.items():
+        metrics[arm] = summarize(refs, rows)
+        metrics[arm]["predicted_months"] = dict(Counter(str(parse_output(p["text"])["sentence_months"])
+            for p in rows if p["finish_reason"] == "stop" and parse_output(p["text"]) is not None))
+        metrics[arm]["by_charge"] = {charge: summarize([r for r in refs if r["charge"] == charge],
+            [p for p in rows if p["id"] in {r["id"] for r in refs if r["charge"] == charge}])
+            for charge in sorted({r["charge"] for r in refs})}
+    pairs = (("direct", "generic"), ("direct", "tera"), ("generic", "tera"), ("tera_noaux", "tera"))
+    for baseline, candidate in pairs:
+        comparisons[f"{candidate}_vs_{baseline}"] = compare(refs, predictions[baseline], predictions[candidate]) if all(
+            metrics[a]["eligible_for_full_mae_comparison"] for a in (baseline, candidate)) else {"eligible": False, "reason": "incomplete_valid_coverage"}
+    # Post-hoc diagnostic only: selection depends on model outputs and never replaces full-set results.
+    common = set.intersection(*({d["id"] for d in metrics[a]["per_case"] if d["valid"]} for a in predictions))
+    subset = [r for r in refs if r["id"] in common]
+    post_hoc = {"n": len(subset), "excluded": len(refs) - len(subset), "kind": "post_hoc_common_valid_subset"}
+    if subset:
+        restricted = {a: [p for p in rows if p["id"] in common] for a, rows in predictions.items()}
+        post_hoc["mae"] = {a: summarize(subset, rows)["mae_months_full"] for a, rows in restricted.items()}
+        post_hoc["comparisons"] = {f"{c}_vs_{b}": compare(subset, restricted[b], restricted[c]) for b, c in pairs}
+    return {"metrics": metrics, "comparisons": comparisons, "common_valid": post_hoc}
 
 
 def evaluate(data, root, split="dev"):
     jobs = read_rows(data / "direct.dev.jobs.jsonl") if split == "dev" else frozen_jobs(data, split)
     refs = read_rows(data / f"{split}.references.jsonl")
-    predictions, metrics = {}, {}
+    predictions, decodings = {}, {}
     for arm in ARMS:
         path = root / f"{arm}.{split}.predictions.jsonl"
         predictions[arm] = read_rows(path)
-        check_prediction_identity(jobs, predictions[arm], read_json(str(path) + ".manifest.json"))
-        metrics[arm] = summarize(refs, predictions[arm])
-        metrics[arm]["predicted_months"] = dict(Counter(str(parse_output(p["text"])["sentence_months"])
-            for p in predictions[arm] if p["finish_reason"] == "stop" and parse_output(p["text"]) is not None))
-        metrics[arm]["by_charge"] = {charge: summarize([r for r in refs if r["charge"] == charge],
-            [p for p in predictions[arm] if p["id"] in {r["id"] for r in refs if r["charge"] == charge}])
-            for charge in sorted({r["charge"] for r in refs})}
-    comparisons = {}
-    for baseline, candidate in (("direct", "generic"), ("direct", "tera"), ("generic", "tera"), ("tera_noaux", "tera")):
-        comparisons[f"{candidate}_vs_{baseline}"] = compare(refs, predictions[baseline], predictions[candidate]) if all(
-            metrics[a]["eligible_for_full_mae_comparison"] for a in (baseline, candidate)) else {"eligible": False, "reason": "incomplete_valid_coverage"}
-    write_json(root / f"{split}.metrics.json", {"version": VERSION, "metrics": metrics, "comparisons": comparisons,
-        "limitations": "Single seed; weak-label semantics unverified; no original-paper reproduction; "
-                        + ("no test evaluation" if split == "dev" else "CAIL-trained external benchmark; not the paper's training protocol")})
+        sidecar = read_json(str(path) + ".manifest.json")
+        check_prediction_identity(jobs, predictions[arm], sidecar)
+        decodings[arm] = "mbr" if "number_decoding" in sidecar["settings"] else "greedy"
+    if len(set(decodings.values())) != 1:
+        raise ValueError("Arms used different number decoding")
+    report = {"version": VERSION, "number_decoding": decodings["direct"]} | score(refs, predictions)
+    if decodings["direct"] == "mbr":
+        report["greedy_number_same_generation"] = score(refs, {a: greedy_view(r) for a, r in predictions.items()})
+        report["mbr_triggered"] = {a: sum("number_decoding" in p for p in r) for a, r in predictions.items()}
+    report["limitations"] = ("Single seed; weak-label semantics unverified; no original-paper reproduction; "
+                             + ("no test evaluation" if split == "dev" else "CAIL-trained external benchmark; not the paper's training protocol"))
+    write_json(root / f"{split}.metrics.json", report)
 
 
 def diagnose_cache(run_dir):
@@ -459,8 +639,8 @@ def diagnose_cache(run_dir):
     from transformers import set_seed
     root = Path(run_dir).resolve()
     execution = read_json(root / "execution.json")
-    if execution["version"] != VERSION:
-        raise ValueError("Wrong experiment version")
+    version = execution["version"]
+    target_mode(version)  # rejects unknown versions; v1 runs remain diagnosable
     budget = read_json(root / "token_budget.json")
     jobs = read_rows(root / "data/direct.dev.jobs.jsonl")
     if digest(jobs) != budget["dev_jobs_hash"] or any(j["prompt_hash"] != digest(j["messages"]) or j["split"] != "dev" for j in jobs):
@@ -470,7 +650,7 @@ def diagnose_cache(run_dir):
         raise ValueError("Changed tokenizer protocol")
     selected = jobs[:3]  # fixed input order, no gold/reference-based selection
     path = root / f"cache_diagnostic_{time.time_ns()}.metrics.json"
-    report = {"kind": "cache_diagnostic_only", "run_dir": str(root), "version": VERSION,
+    report = {"kind": "cache_diagnostic_only", "run_dir": str(root), "version": version,
         "execution_hash": digest(execution), "training_hash": budget["training_hash"],
         "selected_ids": [j["id"] for j in selected], "continuation_steps": 4, "fp32_control_ids": [selected[0]["id"]],
         "training_performed": False, "benchmark_scores_computed": False, "models": {},
@@ -495,7 +675,7 @@ def diagnose_cache(run_dir):
                 raise ValueError("Artifact checksum mismatch")
             manifest = read_json(artifact / "module.json")
             arm = "tera" if name == "smoke" else name
-            expected = {"version": VERSION, "arm": arm, "model": execution["model"],
+            expected = {"version": version, "arm": arm, "model": execution["model"],
                 "training_hash": budget["training_hash"], "chat_protocol": protocol,
                 "seed": execution["seed"], "epochs": execution["epochs"], "max_length": execution["max_length"],
                 "max_steps": 32 if name == "smoke" else -1}
@@ -534,7 +714,8 @@ def diagnose_cache(run_dir):
     return report
 
 
-def run(archive, output, model=DEFAULT_MODEL, seed=42, epochs=3, max_length=8192, smoke_only=False, resume=False, skip_laic=False):
+def run(archive, output, model=DEFAULT_MODEL, seed=42, epochs=3, max_length=8192, smoke_only=False, resume=False,
+        skip_tests=False, decoding="mbr"):
     require_server()
     if epochs <= 0 or max_length <= 2048:
         raise ValueError("Invalid experiment budget")
@@ -544,11 +725,11 @@ def run(archive, output, model=DEFAULT_MODEL, seed=42, epochs=3, max_length=8192
     record = {"version": VERSION, "model": model, "seed": seed, "epochs": epochs, "max_length": max_length,
               "archive_sha256": file_hash(archive), "git_commit": commit.stdout.strip() if commit.returncode == 0 else None,
               "cuda_visible_devices": os.environ["CUDA_VISIBLE_DEVICES"], "arms": ARMS,
-              "smoke_only": smoke_only, "commands": [], "phase": "prepare"}
+              "smoke_only": smoke_only, "decoding": decoding, "commands": [], "phase": "prepare"}
     if resume:
         from .learned_audit import checked_zip
         previous = read_json(out / "execution.json")
-        for key in ("version", "model", "seed", "epochs", "max_length", "archive_sha256", "smoke_only"):
+        for key in ("version", "model", "seed", "epochs", "max_length", "archive_sha256", "smoke_only", "decoding"):
             if previous[key] != record[key]:
                 raise ValueError(f"Resume experiment mismatch: {key}")
         for name, content in checked_zip(archive).items():
@@ -598,7 +779,7 @@ def run(archive, output, model=DEFAULT_MODEL, seed=42, epochs=3, max_length=8192
             if not saved:
                 launch(train_cmd, "train_" + name)
             infer_cmd = [sys.executable, "-m", "egc.tera_server", "infer"] + common + ["--trained", str(out / name),
-                        "--output", str(out / f"{name}.dev.predictions.jsonl")]
+                        "--output", str(out / f"{name}.dev.predictions.jsonl"), "--decoding", decoding]
             reuse = resume and prediction.exists()
             launch(infer_cmd + (["--smoke"] if smoke else []) + (["--validate-only"] if reuse else []),
                    ("revalidate_" if reuse else "infer_") + name)
@@ -622,10 +803,10 @@ def run(archive, output, model=DEFAULT_MODEL, seed=42, epochs=3, max_length=8192
     finally:
         write_json(out / "execution.json", record)
         print("Return experiment evidence:", collect(out), flush=True)
-    if not smoke_only and not skip_laic:
+    if not smoke_only and not skip_tests:
         # Separate process/output: benchmark failure must not invalidate completed training/dev.
-        execute([sys.executable, "-m", "egc.tera_benchmark", "--run-dir", str(out), "--resume"],
-                out / f"logs/laic_{time.time_ns()}.log")
+        execute([sys.executable, "-m", "egc.tera_benchmark", "--run-dir", str(out), "--resume", "--decoding", decoding],
+                out / f"logs/tests_{time.time_ns()}.log")
 
 
 def main():
@@ -645,7 +826,8 @@ def main():
             sub.add_argument("--archive", required=True)
             sub.add_argument("--smoke-only", action="store_true")
             sub.add_argument("--resume", action="store_true")
-            sub.add_argument("--skip-laic", action="store_true", help="Skip the default post-training LAIC evaluation")
+            sub.add_argument("--skip-tests", "--skip-laic", dest="skip_tests", action="store_true",
+                             help="Skip the default post-training LAIC/PCCD/CAIL evaluation")
         else:
             sub.add_argument("--data", required=True)
         if name == "train":
@@ -656,6 +838,8 @@ def main():
             sub.add_argument("--smoke", action="store_true")
             sub.add_argument("--validate-only", action="store_true")
             sub.add_argument("--split", choices=("dev", "test0", "test1", "test2"), default="dev")
+        if name in ("run", "infer"):
+            sub.add_argument("--decoding", choices=DECODINGS, default="mbr" if name == "run" else "greedy")
     args = vars(parser.parse_args())
     command = args.pop("command")
     {"run": run, "train": train, "infer": infer, "diagnose-cache": diagnose_cache}[command](**args)
