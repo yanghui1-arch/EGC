@@ -703,6 +703,41 @@ class SubsetScoringTests(unittest.TestCase):
         self.assertEqual(report["comparisons"]["tera_vs_direct"]["delta_mae_candidate_minus_baseline"], -12)
         self.assertEqual(set(report["common_valid"]["comparisons"]), {"tera_vs_direct", "tera_vs_tera_noaux"})
 
+class PairTokenizer(CharacterTokenizer):
+    """Merges the name 徐某 into one token, like a real BPE vocabulary."""
+    def _pieces(self, text):
+        pieces, i = [], 0
+        while i < len(text):
+            width = 2 if text.startswith("徐某", i) else 1
+            pieces.append((i, i + width))
+            i += width
+        return pieces
+    def encode(self, text, add_special_tokens=False):
+        return [ord(text[a]) + (100000 if b - a == 2 else 0) for a, b in self._pieces(text)]
+    def __call__(self, text, **kwargs):
+        return {"input_ids": self.encode(text), "offset_mapping": self._pieces(text)}
+
+
+class ChunkBoundaryTests(unittest.TestCase):
+    def test_target_token_straddling_160_char_cut_stays_in_pointer_domain(self):
+        from egc.tera_data import fact_tokens, target_char_spans
+        facts = "甲" * 159 + "徐某盗窃。"  # no punctuation before 159: the chunk cut at 160 splits 徐|某
+        visible = {"facts": facts, "charge": "盗窃罪"}
+        spans = target_char_spans(facts, "徐某")
+        ids, meta, chunks = prompt_features(PairTokenizer(), messages(visible, "direct"), spans)
+        self.assertEqual(chunks[0], (0, 160))
+        sentence_tokens = {i for s in meta["sentences"] for i in s}
+        self.assertTrue(set(meta["target_mentions"]) - sentence_tokens)  # the original failure condition
+        self.assertTrue(set(meta["target_mentions"]) <= set(fact_tokens(meta)))
+        self.assertEqual(len(fact_tokens(meta)), len(sentence_tokens) + 1)
+        if torch is not None:
+            from egc.tera_model import EvidenceAdapter
+            adapter = EvidenceAdapter(16, rank=4)
+            hidden = torch.randn(len(ids), 16)
+            memory = adapter.memory(hidden, meta)
+            self.assertEqual(len(memory["pointer"]), len(fact_tokens(meta)))
+            self.assertTrue(torch.isfinite(adapter.pointer_loss(memory, meta)))
+
 
 if __name__ == "__main__":
     unittest.main()

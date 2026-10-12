@@ -30,6 +30,11 @@ def target_char_spans(facts, name):
     return spans
 
 
+def fact_tokens(meta):
+    """Pointer domain; older/synthetic metadata without "facts" falls back to sentence spans."""
+    return meta["facts"] if meta.get("facts") else sorted({i for s in meta["sentences"] for i in s})
+
+
 def sentence_spans(text):
     # Syntax-only boundaries; no legal keyword classification. Long spans are chunked.
     cuts = [0] + [m.end() for m in re.finditer(r"[。！？；\n]+", text)] + [len(text)]
@@ -114,6 +119,8 @@ def prompt_features(tokenizer, messages, target_spans=None):
 
     spans = sentence_spans(visible["facts"])
     meta = {"prompt_length": len(ids),
+            # All fact tokens: a token straddling a 160-char chunk cut belongs to no sentence span.
+            "facts": positions("facts", 0, len(visible["facts"])),
             "sentences": [positions("facts", a, b) for a, b in spans],
             "charge": positions("charge", 0, len(visible["charge"])),
             "target": positions("target_person", 0, len(visible["target_person"])) if "target_person" in visible else []}
@@ -121,6 +128,8 @@ def prompt_features(tokenizer, messages, target_spans=None):
         if any(not 0 <= a < b <= len(visible["facts"]) for a, b in target_spans):
             raise ValueError("Target mention outside facts")
         meta["target_mentions"] = sorted({i for a, b in target_spans for i in positions("facts", a, b)})
+        if not set(meta["target_mentions"]) <= set(meta["facts"]):
+            raise ValueError("Target mention outside fact tokens")
     return ids, meta, spans
 
 

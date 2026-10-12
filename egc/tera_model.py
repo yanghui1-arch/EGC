@@ -5,6 +5,8 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
+from .tera_data import fact_tokens
+
 
 class EvidenceAdapter(nn.Module):
     """target_mode="inferred" (v2) points at the target inside the facts; "explicit" is the v1 field reader."""
@@ -53,7 +55,9 @@ class EvidenceAdapter(nn.Module):
         else:
             if meta["target"]:
                 raise ValueError("Latent-target TERA never reads an explicit target field")
-            facts = sorted({i for s in meta["sentences"] for i in s})
+            facts = fact_tokens(meta)
+            if max(facts) >= meta["prompt_length"]:
+                raise ValueError("Memory must contain prompt tokens only")
             z = self.project(hidden[facts])
             scores = self.target_score(torch.tanh(self.target_e(z) + self.target_c(charge))).squeeze(-1)
             pointer = scores.float().softmax(0)
@@ -69,7 +73,7 @@ class EvidenceAdapter(nn.Module):
         mentions = meta.get("target_mentions")
         if "pointer" not in memory or not mentions:
             return None
-        facts = sorted({i for s in meta["sentences"] for i in s})
+        facts = fact_tokens(meta)
         index = {position: k for k, position in enumerate(facts)}
         if any(m not in index for m in mentions):
             raise ValueError("Target mention outside fact memory")

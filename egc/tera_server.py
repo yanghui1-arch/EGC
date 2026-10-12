@@ -17,7 +17,7 @@ from .learned import fresh
 from .learned_server import DEFAULT_MODEL, check_prediction_identity, collect, execute, unpack
 from .qwen_eos_smoke import select_jobs
 from .server import SFT_TOKENIZATION_VERSION, configure_chat, environment, select_training_mode
-from .tera_data import VERSION, prompt_features, target_mode, training_rows
+from .tera_data import VERSION, fact_tokens, prompt_features, target_mode, training_rows
 from .correct_training import BALANCED, TOKEN_MEAN, sentence_policy
 
 ARMS = ("direct", "generic", "tera_noaux", "tera")
@@ -441,7 +441,7 @@ def generate(network, tokenizer, ids, meta, stops, digits=None, max_new_tokens=2
                 "role_entropy_mean": float(-(probabilities * probabilities.clamp_min(1e-8).log()).sum(-1).mean()),
                 "sentences": len(probabilities), "semantic_accuracy": None}
             if "pointer" in memory:
-                facts = sorted({i for span in meta["sentences"] for i in span})
+                facts = fact_tokens(meta)
                 top = memory["pointer"].topk(min(8, len(facts))).indices.tolist()
                 routing["pointer_top_text"] = [tokenizer.decode([ids[facts[k]]]) for k in top]
                 routing["pointer_max"] = float(memory["pointer"].max())
