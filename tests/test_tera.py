@@ -176,6 +176,17 @@ class OrchestrationTests(unittest.TestCase):
                 self.assertEqual([c[c.index("--arm")+1] for c in commands[2:10:2]], list(ARMS))
                 self.assertTrue(all("-1" in c for c in commands[2:10:2]))
                 score.assert_called_once()
+                # Skipping generic: three fresh arms, scoring and the benchmark see the same subset.
+                commands.clear()
+                run(archive, root / "no_generic", model=root, arms=["tera", "direct", "tera_noaux"])
+                self.assertEqual([c[c.index("--arm")+1] for c in commands if c[3] == "train"],
+                                 ["tera", "direct", "tera_noaux", "tera"])  # smoke first
+                self.assertEqual(score.call_args.kwargs["arms"], ("direct", "tera_noaux", "tera"))
+                self.assertEqual(commands[-1][commands[-1].index("--arms") + 1:], ["direct", "tera_noaux", "tera"])
+                self.assertEqual(read_json(root / "no_generic/execution.json")["arms"], ["direct", "tera_noaux", "tera"])
+                for bad in (["direct", "generic"], ["tera", "tera"], ["tera", "other"]):
+                    with self.assertRaisesRegex(ValueError, "subset"):
+                        run(archive, root / f"bad_{len(commands)}_{bad[-1]}", model=root, arms=bad)
                 with patch("egc.tera_server.read_rows", return_value=[{"text": "bad", "finish_reason": "length"}]):
                     with self.assertRaisesRegex(ValueError, "Smoke termination"):
                         run(archive, root / "failed", model=root)
@@ -679,6 +690,19 @@ class NumberDecodingTests(unittest.TestCase):
                 self.assertAlmostEqual(result["kept_mass"], 1.0, places=5)
                 self.assertAlmostEqual(result["mean_months"], sum(v * w for v, w in ordered), places=4)
                 self.assertEqual(result["pruned_mass"], 0.0)
+
+class SubsetScoringTests(unittest.TestCase):
+    def test_skipped_generic_only_removes_its_comparisons(self):
+        from egc.tera_server import score
+        refs = [{"id": str(i), "charge": "示例", "sentence_months": 12, "opinion": None} for i in range(3)]
+        def rows(month):
+            return [{"id": str(i), "text": json.dumps({"reasoning": "r", "sentence_months": month}), "finish_reason": "stop"}
+                    for i in range(3)]
+        report = score(refs, {"direct": rows(24), "tera_noaux": rows(18), "tera": rows(12)})
+        self.assertEqual(set(report["comparisons"]), {"tera_vs_direct", "tera_vs_tera_noaux"})
+        self.assertEqual(report["comparisons"]["tera_vs_direct"]["delta_mae_candidate_minus_baseline"], -12)
+        self.assertEqual(set(report["common_valid"]["comparisons"]), {"tera_vs_direct", "tera_vs_tera_noaux"})
+
 
 if __name__ == "__main__":
     unittest.main()

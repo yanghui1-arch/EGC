@@ -13,10 +13,10 @@ from .learned import fresh
 from .learned_server import collect, execute
 from .server import SFT_TOKENIZATION_VERSION
 from .tera_data import VERSION, prompt_features, target_mode
-from .tera_server import ARMS, DECODINGS, file_hash, frozen_jobs, tokenizer_for, require_server, evaluate
+from .tera_server import ARMS, DECODINGS, file_hash, frozen_jobs, tokenizer_for, require_server, evaluate, select_arms
 
 
-def run(run_dir, output=None, max_length=32768, resume=False, splits=None, decoding="mbr"):
+def run(run_dir, output=None, max_length=32768, resume=False, splits=None, decoding="mbr", arms=None):
     require_server()
     source = Path(run_dir).resolve()
     data = source / "data"
@@ -27,6 +27,10 @@ def run(run_dir, output=None, max_length=32768, resume=False, splits=None, decod
         raise ValueError("Finish all four training/dev arms before benchmark evaluation")
     if decoding not in DECODINGS:
         raise ValueError("Unknown decoding")
+    # Default: exactly the arms the training run trained.
+    arms = select_arms(arms or execution.get("arms", ARMS))
+    if set(arms) - set(execution.get("arms", ARMS)):
+        raise ValueError("Requested arms were not trained in this run")
     tests = read_json(data / "manifest.json")["tests"]
     splits = list(splits or [t["name"] for t in tests])
     if len(set(splits)) != len(splits) or not set(splits) <= {"dev"} | {t["name"] for t in tests}:
@@ -46,7 +50,7 @@ def run(run_dir, output=None, max_length=32768, resume=False, splits=None, decod
         "splits": splits, "benchmarks": benchmarks, "jobs_hash": {s: digest(j) for s, j in split_jobs.items()},
         "training_hash": budget["training_hash"], "decoding": decoding,
         "model": execution["model"], "seed": execution["seed"], "max_length": max_length,
-        "max_new_tokens": 2048, "arms": list(ARMS), "checkpoint_selection": "final",
+        "max_new_tokens": 2048, "arms": list(arms), "checkpoint_selection": "final",
         "test_used_for_selection": False, "training_performed": False}
     out = Path(output).resolve() if output else source / f"benchmark_{decoding}"
     if out == source or source in out.parents and out.relative_to(source).parts[0] in ("data", *ARMS, "smoke"):
@@ -83,7 +87,7 @@ def run(run_dir, output=None, max_length=32768, resume=False, splits=None, decod
         if overlength:
             raise ValueError("Context budget exceeded; no cases removed or truncated; inspect preflight.metrics.json")
         # Check all checkpoints before launching any evaluation, then copy only small provenance files.
-        for arm in ARMS:
+        for arm in arms:
             trained = source / arm
             manifest = read_json(trained / "run_manifest.json")
             finished = read_json(trained / "completion.json")
@@ -106,7 +110,7 @@ def run(run_dir, output=None, max_length=32768, resume=False, splits=None, decod
         # Split-major order: each split is scored before the next starts, so partial runs stay usable.
         for split in splits:
             limit = execution["max_length"] if split == "dev" else max_length
-            for arm in ARMS:
+            for arm in arms:
                 prediction = out / f"{arm}.{split}.predictions.jsonl"
                 command = [sys.executable, "-m", "egc.tera_server", "infer", "--data", str(data),
                     "--trained", str(source / arm), "--output", str(prediction), "--model", execution["model"],
@@ -117,7 +121,7 @@ def run(run_dir, output=None, max_length=32768, resume=False, splits=None, decod
                 record["phase"] = f"infer_{split}_{arm}"
                 write_json(out / "execution.json", record)
                 record["commands"].append(execute(command, out / f"logs/{split}_{arm}_{time.time_ns()}.log"))
-            evaluate(data, out, split=split)
+            evaluate(data, out, split=split, arms=arms)
         record["phase"] = "complete_benchmark"
         write_json(out / "completion.json", {"complete": True, "phase": "complete_benchmark", "splits": splits,
             "decoding": decoding, "test_evaluated": any(s != "dev" for s in splits), "test_used_for_selection": False})
@@ -138,6 +142,7 @@ def main():
     parser.add_argument("--splits", nargs="+",
                         help="Default: every frozen test (test0 LAIC, test1 PCCD, test2 CAIL); dev re-decodes dev")
     parser.add_argument("--decoding", choices=DECODINGS, default="mbr")
+    parser.add_argument("--arms", nargs="+", choices=ARMS, help="Default: the arms trained in the run")
     run(**vars(parser.parse_args()))
 
 

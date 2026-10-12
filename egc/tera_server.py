@@ -21,6 +21,15 @@ from .tera_data import VERSION, prompt_features, target_mode, training_rows
 from .correct_training import BALANCED, TOKEN_MEAN, sentence_policy
 
 ARMS = ("direct", "generic", "tera_noaux", "tera")
+PAIRS = (("direct", "generic"), ("direct", "tera"), ("generic", "tera"), ("tera_noaux", "tera"))
+
+
+def select_arms(arms):
+    """Canonical-order subset; tera is required. Skipped arms only remove the comparisons they enter."""
+    chosen = list(arms or ARMS)
+    if len(chosen) != len(set(chosen)) or set(chosen) - set(ARMS) or "tera" not in chosen:
+        raise ValueError("Arms must be a subset of direct/generic/tera_noaux/tera that includes tera")
+    return tuple(a for a in ARMS if a in chosen)
 DECODINGS = ("greedy", "mbr")
 MBR = {"version": "number-median-mbr-v1", "threshold": 1e-3, "max_digits": 3}
 MONTH_KEY = re.compile(r'"sentence_months"\s*:\s*$')
@@ -595,7 +604,7 @@ def score(refs, predictions):
         metrics[arm]["by_charge"] = {charge: summarize([r for r in refs if r["charge"] == charge],
             [p for p in rows if p["id"] in {r["id"] for r in refs if r["charge"] == charge}])
             for charge in sorted({r["charge"] for r in refs})}
-    pairs = (("direct", "generic"), ("direct", "tera"), ("generic", "tera"), ("tera_noaux", "tera"))
+    pairs = [(b, c) for b, c in PAIRS if b in predictions and c in predictions]
     for baseline, candidate in pairs:
         comparisons[f"{candidate}_vs_{baseline}"] = compare(refs, predictions[baseline], predictions[candidate]) if all(
             metrics[a]["eligible_for_full_mae_comparison"] for a in (baseline, candidate)) else {"eligible": False, "reason": "incomplete_valid_coverage"}
@@ -610,11 +619,11 @@ def score(refs, predictions):
     return {"metrics": metrics, "comparisons": comparisons, "common_valid": post_hoc}
 
 
-def evaluate(data, root, split="dev"):
+def evaluate(data, root, split="dev", arms=ARMS):
     jobs = read_rows(data / "direct.dev.jobs.jsonl") if split == "dev" else frozen_jobs(data, split)
     refs = read_rows(data / f"{split}.references.jsonl")
     predictions, decodings = {}, {}
-    for arm in ARMS:
+    for arm in select_arms(arms):
         path = root / f"{arm}.{split}.predictions.jsonl"
         predictions[arm] = read_rows(path)
         sidecar = read_json(str(path) + ".manifest.json")
@@ -622,8 +631,9 @@ def evaluate(data, root, split="dev"):
         decodings[arm] = "mbr" if "number_decoding" in sidecar["settings"] else "greedy"
     if len(set(decodings.values())) != 1:
         raise ValueError("Arms used different number decoding")
-    report = {"version": VERSION, "number_decoding": decodings["direct"]} | score(refs, predictions)
-    if decodings["direct"] == "mbr":
+    decoding = decodings["tera"]
+    report = {"version": VERSION, "arms": list(predictions), "number_decoding": decoding} | score(refs, predictions)
+    if decoding == "mbr":
         report["greedy_number_same_generation"] = score(refs, {a: greedy_view(r) for a, r in predictions.items()})
         report["mbr_triggered"] = {a: sum("number_decoding" in p for p in r) for a, r in predictions.items()}
     report["limitations"] = ("Single seed; weak-label semantics unverified; no original-paper reproduction; "
@@ -715,8 +725,9 @@ def diagnose_cache(run_dir):
 
 
 def run(archive, output, model=DEFAULT_MODEL, seed=42, epochs=3, max_length=8192, smoke_only=False, resume=False,
-        skip_tests=False, decoding="mbr"):
+        skip_tests=False, decoding="mbr", arms=ARMS):
     require_server()
+    arms = select_arms(arms)
     if epochs <= 0 or max_length <= 2048:
         raise ValueError("Invalid experiment budget")
     out = Path(output).resolve() if resume else fresh(output).resolve()
@@ -724,7 +735,7 @@ def run(archive, output, model=DEFAULT_MODEL, seed=42, epochs=3, max_length=8192
     commit = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True)
     record = {"version": VERSION, "model": model, "seed": seed, "epochs": epochs, "max_length": max_length,
               "archive_sha256": file_hash(archive), "git_commit": commit.stdout.strip() if commit.returncode == 0 else None,
-              "cuda_visible_devices": os.environ["CUDA_VISIBLE_DEVICES"], "arms": ARMS,
+              "cuda_visible_devices": os.environ["CUDA_VISIBLE_DEVICES"], "arms": list(arms),
               "smoke_only": smoke_only, "decoding": decoding, "commands": [], "phase": "prepare"}
     if resume:
         from .learned_audit import checked_zip
@@ -792,9 +803,10 @@ def run(archive, output, model=DEFAULT_MODEL, seed=42, epochs=3, max_length=8192
         if not gate["passed"]:
             raise ValueError("Smoke termination gate failed; full runs not started")
         if not smoke_only:
-            for arm in ARMS:
+            # --resume with more arms adds e.g. generic later; saved arms are revalidated, not retrained.
+            for arm in arms:
                 pair(arm)  # Fresh base + fresh module; never resume the smoke weights.
-            evaluate(out / "data", out)
+            evaluate(out / "data", out, arms=arms)
         record["phase"] = "complete_smoke" if smoke_only else "complete_dev"
         write_json(out / "completion.json", {"complete": True, "phase": record["phase"], "test_evaluated": False})
     except Exception as exc:
@@ -805,7 +817,8 @@ def run(archive, output, model=DEFAULT_MODEL, seed=42, epochs=3, max_length=8192
         print("Return experiment evidence:", collect(out), flush=True)
     if not smoke_only and not skip_tests:
         # Separate process/output: benchmark failure must not invalidate completed training/dev.
-        execute([sys.executable, "-m", "egc.tera_benchmark", "--run-dir", str(out), "--resume", "--decoding", decoding],
+        execute([sys.executable, "-m", "egc.tera_benchmark", "--run-dir", str(out), "--resume", "--decoding", decoding,
+                 "--arms", *arms],
                 out / f"logs/tests_{time.time_ns()}.log")
 
 
@@ -828,6 +841,8 @@ def main():
             sub.add_argument("--resume", action="store_true")
             sub.add_argument("--skip-tests", "--skip-laic", dest="skip_tests", action="store_true",
                              help="Skip the default post-training LAIC/PCCD/CAIL evaluation")
+            sub.add_argument("--arms", nargs="+", choices=ARMS, default=list(ARMS),
+                             help="Subset to train/evaluate (must include tera); e.g. skip generic")
         else:
             sub.add_argument("--data", required=True)
         if name == "train":

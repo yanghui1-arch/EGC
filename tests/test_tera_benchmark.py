@@ -97,6 +97,15 @@ class BenchmarkTests(unittest.TestCase):
                 commands.clear()
                 run(source, root / "legacy", splits=["test1"])
                 self.assertEqual(len(commands), 4)
+                # A run trained without generic evaluates only its own arms; generic cannot be requested.
+                write_json(source / "execution.json", legacy | {"arms": ["direct", "tera_noaux", "tera"]})
+                commands.clear()
+                run(source, root / "subset", splits=["test1"])
+                self.assertEqual([c[c.index("--trained")+1].rsplit("/", 1)[-1].rsplit("\\", 1)[-1] for c in commands],
+                                 ["direct", "tera_noaux", "tera"])
+                self.assertEqual(read_json(root / "subset/test1.metrics.json")["arms"], ["direct", "tera_noaux", "tera"])
+                with self.assertRaisesRegex(ValueError, "not trained"):
+                    run(source, root / "subset_generic", splits=["test1"], arms=list(ARMS))
             altered = [dict(jobs[0], messages=[{"role": "user", "content": "gold answer"}]), jobs[1]]
             write_rows(data / "direct.test0.jobs.jsonl", altered)
             with self.assertRaisesRegex(ValueError, "noncanonical"):

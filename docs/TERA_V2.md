@@ -14,7 +14,7 @@
 |---|---|---|
 | 去目标输入包 | train/dev/test的prompt统一没有`target_person`。目标人名在案情中的字面位置只写入标签侧文件`{train,dev}.target_supervision.jsonl`，永不进入模型输入；人名后紧跟“某/X/×/*”时视为他人名（如张某某）并跳过。默认SFT损失不变，月份半权损失只作为可选消融`--balanced-sentence-loss` | `egc/correct_training.py`，版本`implicit-target-sentence-v2` |
 | 潜在目标指针 | 在全部事实token上做由罪名调节的打分和softmax，加权求和得到目标向量，替代v1的显式人名池化；之后的路由（target/other/uncertain角色概率加权三路读取）不变。弱监督为`-log(指针落在目标人名token上的总质量)`，与角色交叉熵相加，权重仍为0.1 | `egc/tera_model.py`，`target_mode="inferred"` |
-| 公平对照 | generic有相同的指针和指针损失，只缺角色路由；tera_noaux没有任何辅助损失（角色和指针都关）；direct不带模块。四组使用同一个去目标数据包 | 同上；参数量tera/generic差异仍<5% |
+| 对照 | generic有相同的指针和指针损失，只缺角色路由；tera_noaux没有任何辅助损失（角色和指针都关）；direct不带模块。各组使用同一个去目标数据包。**2026-10-12按用户决定，本轮用`--arms`跳过generic** | 同上；参数量tera/generic差异仍<5% |
 | 数值MBR解码 | 生成到`"sentence_months": `、且greedy下一个token是数字时，展开一棵数字树（最多3位，联合概率<1e-3的分支剪掉并记录损失质量），得到整数月数分布，取**中位数**（期望绝对误差最小）写入，并禁止紧接的数字token改写它。同一次生成同时记录greedy整数，因此一次运行就能得到MBR和原greedy两套结果 | `egc/tera_server.py`：`number_mbr`/`generate`/`greedy_view` |
 | 机制诊断 | 每条预测记录指针最高的事实token；dev额外记录指针落在金标目标人名上的质量（标签只用于事后评分，不参与生成） | `routing_diagnostic` |
 | 评测 | 默认依次评测LAIC/PCCD/CAIL三个测试集，也可重解码dev；兼容已保存的v1权重，用于单独测量解码的作用；输出完整集指标、greedy对照、MBR触发数，以及明确标注的事后共同有效子集 | `egc/tera_benchmark.py` |
@@ -25,7 +25,7 @@ v1的显式模式保留，只供已保存的v1权重推理使用；新训练拒�
 
 1. **解码贡献（不属于模块）：** 用v1 seed42已保存权重，在同一prompt上跑MBR和greedy。greedy整数应逐例复现旧预测，这一项作为软件正确性核验。MBR带来的差异是所有组共享的解码协议效应，不能算作TERA的贡献。
 2. **协议修订贡献：** direct v1（显式目标，greedy）与direct v2（无目标，同解码）比较，反映训练/测试输入一致化本身的作用。
-3. **模块贡献（H5）：** 同一v2数据包、同解码条件下比较tera与generic/tera_noaux/direct，判定标准不变，包括原定的3%门槛、完整覆盖和多seed要求。只有tera稳定优于generic，才能说明角色路由有独立作用。
+3. **模块贡献（H5）：** 同一v2数据包、同解码条件下比较tera与tera_noaux/direct，判定标准不变，包括原定的3%门槛、完整覆盖和多seed要求。本轮跳过generic，因此即使tera胜出，也只能说明“加模块+弱监督”有用，不能说明角色路由本身有独立作用，也不能排除参数量的作用。需要做这个机制主张时，再在同一run目录用`--resume`补generic。
 4. **机制：** dev上的指针目标质量只能说明“指向人名token”，不等于语义上的主体归属正确；独立审阅仍需要另外完成。
 
 ## 4. 风险与局限

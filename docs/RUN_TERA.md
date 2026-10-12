@@ -7,23 +7,25 @@ cd /mnt/yanghui/EGC
 git pull --ff-only
 ```
 
-**A. v2四组完整实验（GPU1，预计约20小时）**
+**2026-10-12用户决定：本轮跳过generic。** A和B都只跑direct/tera_noaux/tera。结果只能说明TERA是否胜过不加模块和不加弱监督的版本，不能排除“同参数量普通适配器也能涨”的解释；之后如需补generic，在同一run目录加`--resume --arms direct generic tera_noaux tera`，已完成的组只做复核，不重训。
+
+**A. v2三组实验（GPU1，预计约15小时）**
 
 ```bash
 # 1) 从服务器已有v1包生成去目标包（纯本地重打包，几十秒，无GPU/API）
 python -m egc.correct_training   --archive data/learned_v2_screened/experiment.zip   --output data/learned_v3_latent
-# 2) smoke → direct/generic/tera_noaux/tera 各从基座训练3 epochs → 528 dev → LAIC/PCCD/CAIL
-CUDA_VISIBLE_DEVICES=1 python -m egc.tera_server run   --archive data/learned_v3_latent/experiment.zip   --output "runs/tera_v2_qwen25_7b_seed42_$(date +%Y%m%d_%H%M%S)"   --model /mnt/yanghui/models/Qwen/Qwen2.5-7B   --seed 42 --epochs 3 --max-length 8192
+# 2) smoke → direct/tera_noaux/tera 各从基座训练3 epochs → 528 dev → LAIC/PCCD/CAIL
+CUDA_VISIBLE_DEVICES=1 python -m egc.tera_server run   --archive data/learned_v3_latent/experiment.zip   --output "runs/tera_v2_qwen25_7b_seed42_$(date +%Y%m%d_%H%M%S)"   --model /mnt/yanghui/models/Qwen/Qwen2.5-7B   --seed 42 --epochs 3 --max-length 8192 --arms direct tera_noaux tera
 ```
 
 - 输入：`data/learned_v2_screened/experiment.zip`（应为SHA256 `55e6eb8c…`，脚本会写进correction.json）。输出：`data/learned_v3_latent/{experiment.zip,correction.json}`和新的run目录。
 - 训练超参、LoRA、上下文、BF16、2048输出上限都与v1相同。dev和测试统一使用MBR解码；greedy整数在同一次生成中一并记录，`*.metrics.json`同时给出两套结果。
 - 训练/dev结束时打印`Return experiment evidence:`（`run目录/results.zip`）；随后自动评测三个测试集，结束时打印`Return benchmark evidence:`（`run目录/benchmark_mbr/results.zip`）。
 
-**B. 只换解码、不训练：v1 seed42已保存权重（GPU0，预计约16小时，可按split分批）**
+**B. 只换解码、不训练：v1 seed42已保存权重（GPU0，预计约12小时，可按split分批）**
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 python -m egc.tera_benchmark   --run-dir runs/tera_qwen25_7b_seed42_20260928_181851_23453   --splits dev test1 test2 test0 --decoding mbr
+CUDA_VISIBLE_DEVICES=0 python -m egc.tera_benchmark   --run-dir runs/tera_qwen25_7b_seed42_20260928_181851_23453   --splits dev test1 test2 test0 --decoding mbr --arms direct tera_noaux tera
 ```
 
 - 输出到`原run目录/benchmark_mbr/`，不改原权重或预测。每个split跑完就立即评分，中断后加`--resume`续跑；输入身份不变时已完成的组只做复核。
